@@ -1,11 +1,12 @@
 """
 WiZ Screen Sync
-A desktop app that makes Philips WiZ bulbs follow the colors on your screen.
+A desktop app for Philips WiZ bulbs: screen sync, music sync, manual control,
+WiZ scenes, schedules and a sleep timer. Talks to the bulbs directly over Wi-Fi.
 
 Unofficial. Not affiliated with, endorsed by or sponsored by Signify, WiZ or Philips.
 
 Run:   python wiz_sync_app.py
-Needs: pip install customtkinter mss numpy
+Needs: pip install customtkinter mss numpy pystray pillow soundcard
 
 Copyright (c) 2026 Mihir Sheth. MIT License, see LICENSE.
 """
@@ -67,6 +68,22 @@ DEFAULTS = {
     "launch_at_login": False,
     "restore_on_stop": True,
     "close_to_tray": True,
+    "sync_source": "Screen",          # what Start sync follows: Screen or Music
+    "music_mode": "Beat pulse",
+    "music_palette": "Rainbow",
+    "music_sensitivity": 1.0,
+    "music_min_brightness": 20,
+    "music_max_brightness": 100,
+    "music_fps": 12,
+    "music_smoothing": 0.3,
+    "music_split_colors": True,
+    "control_target": "All bulbs",
+    "control_brightness": 80,
+    "control_kelvin": 3000,
+    "control_color": [255, 140, 60],
+    "scene_speed": 100,
+    "scene_brightness": 80,
+    "schedules": [],                  # see ScheduleDialog for the fields
     "bulbs": {},  # ip -> {"name", "enabled", "zone", "brightness_scale"}
 }
 
@@ -257,117 +274,133 @@ def pick_color(pixels, mode="Vivid", saturation_boost=2.0):
     return r, g, b, brightness
 
 
-# ======================================================================= sync engine
+# ======================================================================= WiZ scenes and whites
 
-class SyncEngine(threading.Thread):
-    """Captures the screen and drives the bulbs. Reads settings live every frame."""
+# The built-in WiZ scenes (scene id -> name). Speed applies to the moving ones.
+SCENES = {
+    1: "Ocean", 2: "Romance", 3: "Sunset", 4: "Party", 5: "Fireplace", 6: "Cozy", 7: "Forest",
+    8: "Pastel colors", 9: "Wake up", 10: "Bedtime", 11: "Warm white", 12: "Daylight",
+    13: "Cool white", 14: "Night light", 15: "Focus", 16: "Relax", 17: "True colors",
+    18: "TV time", 19: "Plant growth", 20: "Spring", 21: "Summer", 22: "Fall", 23: "Deep dive",
+    24: "Jungle", 25: "Mojito", 26: "Club", 27: "Christmas", 28: "Halloween", 29: "Candlelight",
+    30: "Golden white", 31: "Pulse", 32: "Steampunk",
+}
+SCENE_IDS = {name: sid for sid, name in SCENES.items()}
+# Grouping used on the Scenes page
+SCENE_GROUPS = [
+    ("Moving color", [1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32]),
+    ("Whites and daily", [11, 12, 13, 14, 15, 16, 17, 18, 19, 29, 30, 9, 10]),
+]
+# Rough two-tone look of each scene, used for the chips and the room picture only
+SCENE_LOOK = {
+    1: ((20, 90, 200), (40, 200, 210)), 2: ((230, 60, 110), (150, 40, 160)),
+    3: ((255, 110, 40), (230, 50, 70)), 4: ((255, 40, 120), (60, 90, 255)),
+    5: ((255, 90, 20), (255, 170, 40)), 6: ((255, 140, 60), (240, 90, 60)),
+    7: ((40, 160, 60), (150, 200, 60)), 8: ((250, 170, 200), (160, 200, 255)),
+    9: ((255, 150, 60), (255, 230, 190)), 10: ((255, 130, 50), (120, 60, 30)),
+    11: ((255, 190, 120), (255, 200, 140)), 12: ((255, 245, 230), (240, 245, 255)),
+    13: ((220, 235, 255), (200, 220, 255)), 14: ((255, 120, 40), (160, 70, 20)),
+    15: ((240, 245, 255), (255, 250, 240)), 16: ((255, 180, 100), (255, 200, 140)),
+    17: ((255, 235, 215), (255, 240, 225)), 18: ((120, 90, 200), (255, 150, 80)),
+    19: ((230, 60, 200), (140, 40, 220)), 20: ((150, 220, 90), (255, 180, 200)),
+    21: ((255, 200, 50), (60, 200, 200)), 22: ((220, 110, 30), (170, 60, 30)),
+    23: ((20, 40, 140), (40, 120, 200)), 24: ((40, 150, 50), (200, 200, 40)),
+    25: ((130, 230, 80), (230, 255, 150)), 26: ((200, 30, 255), (30, 200, 255)),
+    27: ((220, 30, 30), (30, 170, 60)), 28: ((255, 110, 0), (130, 40, 170)),
+    29: ((255, 140, 40), (255, 100, 20)), 30: ((255, 200, 110), (255, 215, 140)),
+    31: ((255, 60, 60), (60, 60, 255)), 32: ((200, 120, 50), (90, 160, 160)),
+}
+STATIC_SCENES = {11, 12, 13, 14, 15, 16, 17, 18, 19, 29, 30}
+
+MIN_KELVIN, MAX_KELVIN = 2200, 6500
+
+
+def kelvin_to_rgb(k):
+    """Approximate color of a white at k kelvin (Tanner Helland's fit)."""
+    t = max(1000, min(40000, k)) / 100.0
+    if t <= 66:
+        r = 255
+        g = 99.4708025861 * np.log(t) - 161.1195681661
+        b = 0 if t <= 19 else 138.5177312231 * np.log(t - 10) - 305.0447927307
+    else:
+        r = 329.698727446 * ((t - 60) ** -0.1332047592)
+        g = 288.1221695283 * ((t - 60) ** -0.0755148492)
+        b = 255
+    return tuple(int(max(0, min(255, v))) for v in (r, g, b))
+
+
+def state_to_display(state):
+    """Turn a getPilot result into (rgb or None, dimming, words) for the UI."""
+    if not state:
+        return None, 0, "Not answering"
+    if not state.get("state", True):
+        return None, 0, "Off"
+    dim = int(state.get("dimming", 100))
+    sid = state.get("sceneId", 0)
+    if sid:
+        look = SCENE_LOOK.get(sid, ((255, 200, 140), (255, 200, 140)))[0]
+        return look, dim, SCENES.get(sid, f"Scene {sid}")
+    if "temp" in state and state.get("temp"):
+        return kelvin_to_rgb(state["temp"]), dim, f"White {state['temp']}K"
+    if all(k in state for k in ("r", "g", "b")):
+        return (state["r"], state["g"], state["b"]), dim, "Color"
+    return (255, 200, 140), dim, "On"
+
+
+# ======================================================================= engines
+
+class BulbEngine(threading.Thread):
+    """
+    Base for anything that drives the bulbs continuously (screen sync, music sync).
+    Remembers each bulb's state first and puts it back when stopped.
+    Subclasses implement loop(sock).
+    """
+    kind = "sync"
 
     def __init__(self, get_settings):
         super().__init__(daemon=True)
         self.get_settings = get_settings
         self.stop_event = threading.Event()
         self.current = {}        # ip -> (r, g, b, dimming) last sent
-        self.preview = None      # small RGB thumbnail of the captured screen
-        self.hold_until = {}     # ip -> time; the engine leaves that bulb alone until then
-        self.status = "Starting"
+        self.preview = None      # screen thumbnail (screen) or spectrum bars (music)
+        self.hold_until = {}     # ip -> time; leave that bulb alone until then (Identify)
         self.error = None
         self.actual_fps = 0.0
         self.saved_states = {}
+        self._sock = None
 
     def stop(self):
         self.stop_event.set()
 
+    def enabled_bulbs(self, s):
+        return {ip: b for ip, b in s["bulbs"].items() if b.get("enabled", True)}
+
+    def remember(self, ip):
+        if ip not in self.saved_states:
+            self.saved_states[ip] = bulb_get_state(self._sock, ip)
+
+    def held(self, ip):
+        return self.hold_until.get(ip, 0) > time.time()
+
+    def send_color(self, ip, rgb, dim, last_sent, threshold):
+        """Send a color if it changed enough since the last one. Returns True if sent."""
+        key = (int(rgb[0]), int(rgb[1]), int(rgb[2]), int(dim))
+        old = last_sent.get(ip)
+        if old is not None and len(old) == 4 and isinstance(old[0], int):
+            if max(abs(x - y) for x, y in zip(key, old)) < max(1, threshold):
+                return False
+        bulb_send(self._sock, ip, {"state": True, "r": key[0], "g": key[1], "b": key[2],
+                                   "c": 0, "w": 0, "dimming": key[3]})
+        last_sent[ip] = key
+        self.current[ip] = key
+        return True
+
     def run(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.settimeout(0.5)
         try:
-            import mss
-        except ImportError:
-            self.error = "Missing package 'mss'. Run: pip install mss"
-            return
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(0.5)
-        smooth, last_sent = {}, {}
-        frames, fps_t0 = 0, time.perf_counter()
-        try:
-            grabber = getattr(mss, "MSS", None) or mss.mss
-            with grabber() as sct:
-                self.status = "Syncing"
-                while not self.stop_event.is_set():
-                    t0 = time.perf_counter()
-                    s = self.get_settings()
-                    bulbs = {ip: b for ip, b in s["bulbs"].items() if b.get("enabled", True)}
-                    for ip in bulbs:
-                        if ip not in self.saved_states:
-                            self.saved_states[ip] = bulb_get_state(sock, ip)
-
-                    mon_idx = s["monitor"] if 0 < s["monitor"] < len(sct.monitors) else 1
-                    step = max(1, int(s["sample_step"]))
-                    shot = np.asarray(sct.grab(sct.monitors[mon_idx]))
-                    frame = shot[::step, ::step, 2::-1]
-                    k = max(1, shot.shape[1] // 240)
-                    self.preview = shot[::k, ::k, 2::-1]   # small copy for the UI thumbnail
-                    frame = crop_margins(frame, s)
-                    if s["ignore_black_bars"]:
-                        frame = strip_black_bars(frame)
-
-                    for ip, b in bulbs.items():
-                        if self.hold_until.get(ip, 0) > time.time():
-                            last_sent.pop(ip, None)   # resend a color as soon as the hold ends
-                            continue
-                        r, g, bl, bright = pick_color(crop_zone(frame, b.get("zone", "Full screen")),
-                                                      s["color_mode"], s["saturation"])
-                        a = max(0.0, min(0.95, float(s["smoothing"])))
-                        new = np.array([r, g, bl, bright], dtype=np.float32)
-                        prev = smooth.get(ip)
-                        val = new if prev is None else prev * a + new * (1 - a)
-                        smooth[ip] = val
-                        sr, sg, sb, sbright = (float(x) for x in val)
-
-                        if s["brightness_mode"] == "Fixed":
-                            dim = s["fixed_brightness"]
-                        else:
-                            lo, hi = s["min_brightness"], max(s["min_brightness"], s["max_brightness"])
-                            dim = lo + (hi - lo) * min(1.0, sbright * s["brightness_gain"])
-                        dim = dim * b.get("brightness_scale", 100) / 100
-                        dim = int(max(10, min(100, dim)))
-
-                        is_dark = sbright < s["dark_threshold"] or max(sr, sg, sb) < 1
-                        if is_dark and s["dark_scene"] == "Keep last color" and ip in last_sent:
-                            continue
-                        if is_dark and s["dark_scene"] == "Turn off":
-                            key = ("off",)
-                            params = {"state": False}
-                            shown = (0, 0, 0, 0)
-                        elif is_dark:
-                            key = ("dark", dim)
-                            params = {"state": True, "temp": 2700, "dimming": 10}
-                            shown = (255, 170, 90, 10)
-                        else:
-                            color = (int(sr), int(sg), int(sb), dim)
-                            key = color
-                            params = {"state": True, "r": color[0], "g": color[1], "b": color[2],
-                                      "c": 0, "w": 0, "dimming": dim}
-                            shown = color
-                        old = last_sent.get(ip)
-                        thr = s["change_threshold"]
-                        both_colors = (old is not None and len(key) == 4 and len(old) == 4
-                                       and isinstance(key[0], int) and isinstance(old[0], int))
-                        if both_colors:
-                            changed = max(abs(x - y) for x, y in zip(key, old)) >= max(1, thr)
-                        else:
-                            changed = key != old
-                        if changed:
-                            bulb_send(sock, ip, params)
-                            last_sent[ip] = key
-                            self.current[ip] = shown
-
-                    frames += 1
-                    now = time.perf_counter()
-                    if now - fps_t0 >= 1.0:
-                        self.actual_fps = frames / (now - fps_t0)
-                        frames, fps_t0 = 0, now
-                    fps = max(1.0, min(20.0, float(s["fps"])))
-                    self.stop_event.wait(max(0.0, 1.0 / fps - (time.perf_counter() - t0)))
-        except Exception as exc:  # show any capture/network error in the UI
+            self.loop(self._sock)
+        except Exception as exc:  # shown in the UI
             self.error = f"{type(exc).__name__}: {exc}"
         finally:
             s = self.get_settings()
@@ -376,10 +409,334 @@ class SyncEngine(threading.Thread):
                     params = restore_params(state)
                     if params:
                         for _ in range(3):
-                            bulb_send(sock, ip, params)
+                            bulb_send(self._sock, ip, params)
                             time.sleep(0.04)
+            self._sock.close()
+
+    def loop(self, sock):
+        raise NotImplementedError
+
+
+class ScreenEngine(BulbEngine):
+    """Captures the screen and drives the bulbs. Reads settings live every frame."""
+    kind = "Screen"
+
+    def loop(self, sock):
+        try:
+            import mss
+        except ImportError:
+            self.error = "Screen capture needs the mss package. Run: pip install mss"
+            return
+        smooth, last_sent = {}, {}
+        frames, fps_t0 = 0, time.perf_counter()
+        grabber = getattr(mss, "MSS", None) or mss.mss
+        with grabber() as sct:
+            while not self.stop_event.is_set():
+                t0 = time.perf_counter()
+                s = self.get_settings()
+                bulbs = self.enabled_bulbs(s)
+                for ip in bulbs:
+                    self.remember(ip)
+
+                mon_idx = s["monitor"] if 0 < s["monitor"] < len(sct.monitors) else 1
+                step = max(1, int(s["sample_step"]))
+                shot = np.asarray(sct.grab(sct.monitors[mon_idx]))
+                frame = shot[::step, ::step, 2::-1]
+                k = max(1, shot.shape[1] // 240)
+                self.preview = shot[::k, ::k, 2::-1]
+                frame = crop_margins(frame, s)
+                if s["ignore_black_bars"]:
+                    frame = strip_black_bars(frame)
+
+                for ip, b in bulbs.items():
+                    if self.held(ip):
+                        last_sent.pop(ip, None)
+                        continue
+                    r, g, bl, bright = pick_color(crop_zone(frame, b.get("zone", "Full screen")),
+                                                  s["color_mode"], s["saturation"])
+                    a = max(0.0, min(0.95, float(s["smoothing"])))
+                    new = np.array([r, g, bl, bright], dtype=np.float32)
+                    prev = smooth.get(ip)
+                    val = new if prev is None else prev * a + new * (1 - a)
+                    smooth[ip] = val
+                    sr, sg, sb, sbright = (float(x) for x in val)
+
+                    if s["brightness_mode"] == "Fixed":
+                        dim = s["fixed_brightness"]
+                    else:
+                        lo, hi = s["min_brightness"], max(s["min_brightness"], s["max_brightness"])
+                        dim = lo + (hi - lo) * min(1.0, sbright * s["brightness_gain"])
+                    dim = int(max(10, min(100, dim * b.get("brightness_scale", 100) / 100)))
+
+                    is_dark = sbright < s["dark_threshold"] or max(sr, sg, sb) < 1
+                    if is_dark and s["dark_scene"] == "Keep last color" and ip in last_sent:
+                        continue
+                    if is_dark and s["dark_scene"] == "Turn off":
+                        if last_sent.get(ip) != ("off",):
+                            bulb_send(sock, ip, {"state": False})
+                            last_sent[ip] = ("off",)
+                            self.current[ip] = (0, 0, 0, 0)
+                    elif is_dark:
+                        if last_sent.get(ip) != ("dark",):
+                            bulb_send(sock, ip, {"state": True, "temp": 2700, "dimming": 10})
+                            last_sent[ip] = ("dark",)
+                            self.current[ip] = (255, 170, 90, 10)
+                    else:
+                        self.send_color(ip, (sr, sg, sb), dim, last_sent, s["change_threshold"])
+
+                frames += 1
+                now = time.perf_counter()
+                if now - fps_t0 >= 1.0:
+                    self.actual_fps = frames / (now - fps_t0)
+                    frames, fps_t0 = 0, now
+                fps = max(1.0, min(20.0, float(s["fps"])))
+                self.stop_event.wait(max(0.0, 1.0 / fps - (time.perf_counter() - t0)))
+
+
+# ---------------------------------------------------------------- music
+
+class LoopbackAudio:
+    """
+    Records whatever the PC is playing (WASAPI loopback, via the soundcard package)
+    on its own thread, so a silent PC never blocks the light loop.
+    """
+
+    def __init__(self, samplerate=44100, block=1024):
+        self.samplerate, self.block = samplerate, block
+        self.buffer = queue.Queue(maxsize=8)
+        self.error = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def read(self):
+        """Latest block of mono samples, or None if nothing arrived (silence)."""
+        data = None
+        while True:
+            try:
+                data = self.buffer.get_nowait()
+            except queue.Empty:
+                return data
+
+    def _run(self):
+        try:
+            import warnings
+            import soundcard as sc
+            warnings.filterwarnings("ignore", message=".*discontinuity.*")
+            speaker = sc.default_speaker()
+            mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+            with mic.recorder(samplerate=self.samplerate, blocksize=self.block) as rec:
+                while not self._stop.is_set():
+                    data = rec.record(numframes=self.block)
+                    mono = data.mean(axis=1) if data.ndim > 1 else data
+                    if self.buffer.full():
+                        try:
+                            self.buffer.get_nowait()
+                        except queue.Empty:
+                            pass
+                    self.buffer.put(mono.astype(np.float32))
+        except ImportError:
+            self.error = "Music sync needs the soundcard package. Run: pip install soundcard"
+        except Exception as exc:
+            self.error = f"Could not listen to your PC's audio: {exc}"
+
+
+class MusicAnalyzer:
+    """Turns audio blocks into loudness, bass/mid/treble, beats and spectrum bars."""
+
+    BARS = 24
+
+    def __init__(self, samplerate=44100):
+        self.sr = samplerate
+        self.peak = 1e-3
+        self.band_peaks = np.full(3, 1e-3)
+        self.bass_avg = 0.0
+        self.last_beat = 0.0
+        self.bar_peaks = np.full(self.BARS, 1e-3)
+
+    def analyze(self, mono, sensitivity=1.0, now=None):
+        now = time.time() if now is None else now
+        if mono is None or len(mono) < 64:
+            # silence: let everything decay
+            self.bass_avg *= 0.95
+            return {"level": 0.0, "bands": np.zeros(3), "beat": False, "bars": np.zeros(self.BARS)}
+        rms = float(np.sqrt(np.mean(mono ** 2)))
+        self.peak = max(rms, self.peak * 0.997, 1e-3)
+        level = 0.0 if rms < 2e-4 else min(1.0, rms / self.peak)
+
+        spec = np.abs(np.fft.rfft(mono * np.hanning(len(mono))))
+        freqs = np.fft.rfftfreq(len(mono), 1.0 / self.sr)
+        edges = [(20, 250), (250, 2000), (2000, 8000)]
+        bands = np.array([spec[(freqs >= lo) & (freqs < hi)].mean() if np.any((freqs >= lo) & (freqs < hi))
+                          else 0.0 for lo, hi in edges])
+        self.band_peaks = np.maximum(bands, self.band_peaks * 0.995)
+        norm = np.clip(bands / np.maximum(self.band_peaks, 1e-6), 0, 1)
+        if rms < 2e-4:
+            norm[:] = 0
+
+        # beat: bass jumps clearly above its recent average
+        bass = bands[0]
+        threshold = 1.5 / max(0.3, sensitivity)
+        beat = (bass > self.bass_avg * threshold and level > 0.15 and now - self.last_beat > 0.18)
+        if beat:
+            self.last_beat = now
+        self.bass_avg = self.bass_avg * 0.9 + bass * 0.1 if self.bass_avg else bass
+
+        # spectrum bars on a log scale for the room picture
+        bar_edges = np.geomspace(40, 12000, self.BARS + 1)
+        bars = np.array([spec[(freqs >= bar_edges[i]) & (freqs < bar_edges[i + 1])].mean()
+                         if np.any((freqs >= bar_edges[i]) & (freqs < bar_edges[i + 1])) else 0.0
+                         for i in range(self.BARS)])
+        self.bar_peaks = np.maximum(bars, self.bar_peaks * 0.99)
+        bars = np.clip(bars / np.maximum(self.bar_peaks, 1e-6), 0, 1) * (1.0 if rms >= 2e-4 else 0)
+        return {"level": level, "bands": norm, "beat": beat, "bars": bars}
+
+
+MUSIC_MODES = ["Beat pulse", "Spectrum", "Mellow"]
+MUSIC_PALETTES = {"Rainbow": (0.0, 1.0), "Warm": (0.93, 0.17), "Cool": (0.45, 0.80), "Neon": (0.75, 1.05)}
+
+
+def palette_hue(palette, t):
+    """Map t in [0, 1) onto the hue range of a palette, sweeping back and forth."""
+    lo, hi = MUSIC_PALETTES.get(palette, (0.0, 1.0))
+    if palette == "Rainbow":
+        return t % 1.0
+    if hi < lo:  # range wraps past red
+        hi += 1.0
+    tri = 1 - abs((t % 1.0) * 2 - 1)   # 0 -> 1 -> 0
+    return (lo + (hi - lo) * tri) % 1.0
+
+
+class MusicEngine(BulbEngine):
+    """Listens to the PC's audio and drives the bulbs."""
+    kind = "Music"
+
+    def __init__(self, get_settings, audio_factory=None):
+        super().__init__(get_settings)
+        self.audio_factory = audio_factory or (lambda: LoopbackAudio().start())
+
+    def loop(self, sock):
+        audio = self.audio_factory()
+        analyzer = MusicAnalyzer()
+        hue_t, flash = 0.0, 0.0
+        smooth, last_sent = {}, {}
+        frames, fps_t0 = 0, time.perf_counter()
+        try:
+            while not self.stop_event.is_set():
+                t0 = time.perf_counter()
+                if audio.error:
+                    self.error = audio.error
+                    return
+                s = self.get_settings()
+                bulbs = self.enabled_bulbs(s)
+                for ip in bulbs:
+                    self.remember(ip)
+                info = analyzer.analyze(audio.read(), s["music_sensitivity"])
+                self.preview = info["bars"]
+                mode, palette = s["music_mode"], s["music_palette"]
+
+                if mode == "Beat pulse":
+                    if info["beat"]:
+                        hue_t += 0.13
+                        flash = 1.0
+                    flash *= 0.80
+                    energy = min(1.0, 0.55 * info["level"] + 0.6 * flash)
+                elif mode == "Spectrum":
+                    energy = info["level"]
+                else:  # Mellow
+                    hue_t += 0.002 + 0.01 * info["level"]
+                    energy = info["level"]
+
+                lo, hi = s["music_min_brightness"], max(s["music_min_brightness"], s["music_max_brightness"])
+                for i, (ip, b) in enumerate(sorted(bulbs.items())):
+                    if self.held(ip):
+                        last_sent.pop(ip, None)
+                        continue
+                    offset = (0.5 if palette == "Rainbow" else 0.35) * i if s["music_split_colors"] else 0.0
+                    if mode == "Spectrum":
+                        bass, mid, treble = info["bands"]
+                        rgb = np.array([bass, mid * 0.8, treble]) + 1e-6
+                        if s["music_split_colors"] and i % 2:
+                            rgb = rgb[::-1]
+                        h, sat, _ = colorsys.rgb_to_hsv(*rgb)
+                        r, g, bl = colorsys.hsv_to_rgb(h, min(1.0, sat * 1.6), 1.0)
+                    else:
+                        r, g, bl = colorsys.hsv_to_rgb(palette_hue(palette, hue_t + offset), 1.0, 1.0)
+                    a = max(0.0, min(0.9, float(s["music_smoothing"])))
+                    new = np.array([r * 255, g * 255, bl * 255, energy], dtype=np.float32)
+                    prev = smooth.get(ip)
+                    val = new if prev is None else prev * a + new * (1 - a)
+                    if mode == "Beat pulse" and info["beat"]:
+                        val = new   # beats hit instantly
+                    smooth[ip] = val
+                    dim = lo + (hi - lo) * float(val[3])
+                    dim = int(max(10, min(100, dim * b.get("brightness_scale", 100) / 100)))
+                    self.send_color(ip, val[:3], dim, last_sent, 3)
+
+                frames += 1
+                now = time.perf_counter()
+                if now - fps_t0 >= 1.0:
+                    self.actual_fps = frames / (now - fps_t0)
+                    frames, fps_t0 = 0, now
+                fps = max(4.0, min(20.0, float(s["music_fps"])))
+                self.stop_event.wait(max(0.0, 1.0 / fps - (time.perf_counter() - t0)))
+        finally:
+            audio.stop()
+
+
+# ---------------------------------------------------------------- fades (wake up, bedtime, sleep timer)
+
+class FadeJob(threading.Thread):
+    """
+    Smoothly moves bulbs from one brightness/white to another over some minutes.
+    Wake up: warm and dim -> bright daylight. Bedtime: current -> off.
+    """
+
+    def __init__(self, ips, minutes, start_dim, end_dim, start_k, end_k, turn_off_at_end=False,
+                 on_done=None):
+        super().__init__(daemon=True)
+        self.ips, self.duration = list(ips), max(0.05, minutes) * 60
+        self.start_dim, self.end_dim = start_dim, end_dim
+        self.start_k, self.end_k = start_k, end_k
+        self.turn_off_at_end = turn_off_at_end
+        self.on_done = on_done
+        self.cancel_event = threading.Event()
+        self.progress = 0.0
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        t0 = time.time()
+        step = min(2.0, max(0.25, self.duration / 120))
+        try:
+            while not self.cancel_event.is_set():
+                p = min(1.0, (time.time() - t0) / self.duration)
+                self.progress = p
+                dim = int(round(self.start_dim + (self.end_dim - self.start_dim) * p))
+                k = int(round(self.start_k + (self.end_k - self.start_k) * p))
+                for ip in self.ips:
+                    bulb_send(sock, ip, {"state": True, "temp": k, "dimming": max(10, min(100, dim))})
+                if p >= 1.0:
+                    break
+                self.cancel_event.wait(step)
+            if self.turn_off_at_end and not self.cancel_event.is_set():
+                for ip in self.ips:
+                    bulb_send(sock, ip, {"state": False})
+        finally:
             sock.close()
-            self.status = "Stopped"
+            if self.on_done and not self.cancel_event.is_set():
+                self.on_done()
+
+
+SyncEngine = ScreenEngine
 
 
 # ======================================================================= launch at login (Windows)
@@ -501,11 +858,22 @@ def render_room(w, h, bulbs, thumb, scale=1.0):
     bez = max(2, int(5 * scale))
     d.rounded_rectangle((mx0 - bez, my0 - bez, mx0 + mw + bez, my0 + mh + bez),
                         radius=int(7 * scale), fill=(10, 8, 15), outline=(70, 62, 92), width=max(1, int(scale)))
-    if thumb is not None:
+    if thumb is not None and np.ndim(thumb) == 3:
         t = PILImage.fromarray(np.ascontiguousarray(thumb)).resize((mw, mh), PILImage.BILINEAR)
         img.paste(t, (mx0, my0))
     else:
         d.rectangle((mx0, my0, mx0 + mw, my0 + mh), fill=(24, 20, 34))
+        if thumb is not None:  # music: spectrum bars in the bulbs' colors
+            n = len(thumb)
+            lit = [b["color"] for b in bulbs if b["color"]] or [_rgb(FILAMENT)]
+            gap = max(1, int(2 * scale))
+            bw = (mw - gap * (n + 1)) / n
+            for i, v in enumerate(thumb):
+                col = lit[0] if len(lit) == 1 else tuple(
+                    int(lit[0][c] + (lit[-1][c] - lit[0][c]) * i / max(1, n - 1)) for c in range(3))
+                bh = max(int(2 * scale), int((mh - 12 * scale) * float(v)))
+                x0 = mx0 + gap + i * (bw + gap)
+                d.rectangle((x0, my0 + mh - 6 * scale - bh, x0 + bw, my0 + mh - 6 * scale), fill=col)
     # stand
     sx = w // 2
     d.rectangle((sx - int(7 * scale), my0 + mh + bez, sx + int(7 * scale), my0 + mh + int(24 * scale)),
@@ -516,7 +884,7 @@ def render_room(w, h, bulbs, thumb, scale=1.0):
 
     # outline of the screen area each bulb follows, in that bulb's color
     for i, b in enumerate(bulbs):
-        if not b["color"] or thumb is None:
+        if not b["color"] or thumb is None or np.ndim(thumb) != 3:
             continue
         inset = i * max(2, int(2 * scale))
         x0, y0, x1, y1 = zone_box(b["zone"], mx0, my0, mx0 + mw, my0 + mh)
@@ -541,21 +909,141 @@ def render_room(w, h, bulbs, thumb, scale=1.0):
     return img, (mx0, my0, mw, mh)
 
 
+DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+ACTIONS = ["Turn on", "Turn off", "Set white", "Set color", "Play scene", "Wake-up fade",
+           "Bedtime fade", "Start screen sync", "Start music sync", "Stop sync"]
+QUICK_COLORS = [(255, 40, 40), (255, 120, 20), (255, 200, 40), (60, 220, 90), (40, 210, 200),
+                (40, 110, 255), (130, 60, 255), (230, 50, 200)]
+QUICK_WHITES = [2200, 2700, 4000, 6500]
+
+
+def days_text(days):
+    days = sorted(set(days))
+    if len(days) == 7:
+        return "Every day"
+    if days == [0, 1, 2, 3, 4]:
+        return "Weekdays"
+    if days == [5, 6]:
+        return "Weekends"
+    if not days:
+        return "Never"
+    return ", ".join(DAY_NAMES[d] for d in days)
+
+
+def time_text(hhmm):
+    h, m = (int(x) for x in hhmm.split(":"))
+    return f"{(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
+
+def action_text(sc):
+    a, v = sc["action"], sc.get("value", {})
+    if a == "Turn on":
+        return f"Turn on at {v.get('brightness', 80)}%"
+    if a == "Set white":
+        return f"White {v.get('kelvin', 3000)}K at {v.get('brightness', 80)}%"
+    if a == "Set color":
+        return f"Color at {v.get('brightness', 80)}%"
+    if a == "Play scene":
+        return f"{SCENES.get(v.get('scene', 1), 'Scene')} scene at {v.get('brightness', 80)}%"
+    if a in ("Wake-up fade", "Bedtime fade"):
+        return f"{a} over {v.get('minutes', 30)} min"
+    return a
+
+
+def wheel_image(size):
+    """Hue around the circle, white in the middle, as an RGBA PIL image."""
+    y, x = np.mgrid[0:size, 0:size].astype(np.float32)
+    c = (size - 1) / 2
+    dx, dy = x - c, c - y
+    r = np.sqrt(dx ** 2 + dy ** 2) / c
+    hue = (np.arctan2(dy, dx) / (2 * np.pi)) % 1.0
+    sat = np.clip(r, 0, 1)
+    i = np.floor(hue * 6).astype(int) % 6
+    f = hue * 6 - np.floor(hue * 6)
+    p, q, t = 1 - sat, 1 - sat * f, 1 - sat * (1 - f)
+    v = np.ones_like(sat)
+    rgb = np.zeros((size, size, 3), np.float32)
+    for k, (a, b, cc) in enumerate([(v, t, p), (q, v, p), (p, v, t), (p, q, v), (t, p, v), (v, p, q)]):
+        m = i == k
+        rgb[m, 0], rgb[m, 1], rgb[m, 2] = a[m], b[m], cc[m]
+    alpha = np.clip((1.0 - r) * c * 1.5 + 0.5, 0, 1)   # soft anti-aliased edge
+    out = np.dstack([rgb * 255, alpha * 255]).astype(np.uint8)
+    return PILImage.fromarray(out, "RGBA")
+
+
+class ColorWheel(tk.Canvas):
+    """Click or drag to pick a color. Calls command((r, g, b)) while dragging."""
+
+    def __init__(self, master, size=220, command=None, bg=SURFACE):
+        super().__init__(master, width=size, height=size, bg=bg, highlightthickness=0, bd=0)
+        self.size, self.command = size, command
+        self._img = ImageTk.PhotoImage(wheel_image(size)) if PIL_OK else None
+        if self._img:
+            self.create_image(0, 0, image=self._img, anchor="nw")
+        self.marker = self.create_oval(0, 0, 0, 0, outline="#ffffff", width=3)
+        self.bind("<Button-1>", self._pick)
+        self.bind("<B1-Motion>", self._pick)
+
+    def _pick(self, e):
+        c = (self.size - 1) / 2
+        dx, dy = e.x - c, c - e.y
+        r = min(1.0, (dx * dx + dy * dy) ** 0.5 / c)
+        hue = (np.arctan2(dy, dx) / (2 * np.pi)) % 1.0
+        rgb = tuple(int(v * 255) for v in colorsys.hsv_to_rgb(hue, r, 1.0))
+        self._place(hue, r)
+        if self.command:
+            self.command(rgb)
+
+    def _place(self, hue, sat):
+        c = (self.size - 1) / 2
+        x = c + np.cos(hue * 2 * np.pi) * sat * c
+        y = c - np.sin(hue * 2 * np.pi) * sat * c
+        self.coords(self.marker, x - 9, y - 9, x + 9, y + 9)
+
+    def set_color(self, rgb):
+        h, s, _ = colorsys.rgb_to_hsv(*(v / 255 for v in rgb))
+        self._place(h, s)
+
+
+def kelvin_strip(width, height):
+    img = PILImage.new("RGB", (width, height))
+    d = PILDraw.Draw(img)
+    for x in range(width):
+        k = MIN_KELVIN + (MAX_KELVIN - MIN_KELVIN) * x / max(1, width - 1)
+        d.line((x, 0, x, height), fill=kelvin_to_rgb(k))
+    return img
+
+
+def scene_chip(sid, size=26):
+    a, b = SCENE_LOOK.get(sid, ((255, 200, 140), (255, 200, 140)))
+    s4 = size * 4
+    img = PILImage.new("RGBA", (s4, s4), (0, 0, 0, 0))
+    d = PILDraw.Draw(img)
+    d.pieslice((0, 0, s4 - 1, s4 - 1), 90, 270, fill=a)
+    d.pieslice((0, 0, s4 - 1, s4 - 1), 270, 450, fill=b)
+    return img.resize((size, size), PILImage.LANCZOS)
+
+
 class App(ctk.CTk):
-    PAGES = ("Bulbs", "Color", "Brightness", "Screen", "App")
+    NAV = [("Control", "Scenes", "Schedules"), ("Screen sync", "Music sync"), ("Bulbs", "App")]
 
     def __init__(self, autostart=False):
         super().__init__(fg_color=NIGHT)
         ctk.set_appearance_mode("dark")
         self.title(APP_NAME)
         self._set_window_icon()
-        self.geometry("1080x780")
-        self.minsize(960, 680)
+        self.geometry("1120x820")
+        self.minsize(1000, 720)
 
         self._pick_fonts()
         self.settings = load_settings()
         self.lock = threading.Lock()
         self.engine = None
+        self.fade_job = None
+        self.fade_label = ""
+        self.sleep_deadline = None
+        self.display = {}            # ip -> (rgb or None, dim, words) when nothing is syncing
+        self.status_text = ""
         self.bulb_rows = {}
         self.slider_widgets = {}
         self._save_job = None
@@ -565,14 +1053,21 @@ class App(ctk.CTk):
         self._quitting = False
         self._hero_img = None
         self._last_hero = 0.0
+        self._last_sched_check = 0.0
+        self._fired = set()
+        self._pending_cmd = None
+        self._cmd_job = None
+        self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.cmd_sock.settimeout(0.5)
 
         self._build_header()
         self._build_room()
         self._build_body()
         self._refresh_bulb_rows()
-        self._show_page("Bulbs")
+        self._show_page("Control")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(200, self._tick)
+        self.after(300, self._poll_states)
 
         if not self.settings["bulbs"]:
             self.after(400, self._discover)
@@ -583,12 +1078,12 @@ class App(ctk.CTk):
             self.after(100, self.withdraw if self.tray else self.iconify)
 
     def _set_window_icon(self):
-        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))  # inside the .exe or next to the .py
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
         path = os.path.join(base, "wiz.ico")
         if os.path.exists(path) and sys.platform == "win32":
             try:
                 self.iconbitmap(path)
-                self.after(250, lambda: self.iconbitmap(path))  # customtkinter sets its own icon shortly after start
+                self.after(250, lambda: self.iconbitmap(path))
             except Exception:
                 pass
 
@@ -608,6 +1103,7 @@ class App(ctk.CTk):
         bold_w = "normal" if display_bold != display else "bold"
         self.f_title = ctk.CTkFont(family=display_bold, size=22, weight=bold_w)
         self.f_head = ctk.CTkFont(family=display_bold, size=17, weight=bold_w)
+        self.f_big = ctk.CTkFont(family=display_bold, size=24, weight=bold_w)
         self.f_num = ctk.CTkFont(family=display, size=15)
         self.f_nav = ctk.CTkFont(family=display, size=16)
         self.f_body = ctk.CTkFont(family=body, size=13)
@@ -647,6 +1143,14 @@ class App(ctk.CTk):
                                  dropdown_text_color=MOON, font=self.f_body, dropdown_font=self.f_body,
                                  corner_radius=8)
 
+    def _button(self, parent, text, command, width=110, primary=False, color=None):
+        if primary:
+            return ctk.CTkButton(parent, text=text, command=command, width=width, height=34,
+                                 corner_radius=10, fg_color=FILAMENT, hover_color=FILAMENT_HOVER,
+                                 text_color=NIGHT, font=self.f_button)
+        return ctk.CTkButton(parent, text=text, command=command, width=width, height=34, corner_radius=10,
+                             fg_color=RAISED, hover_color=LINE, text_color=color or MOON, font=self.f_body)
+
     def _ghost_button(self, parent, text, command, color=MUTED, width=80):
         return ctk.CTkButton(parent, text=text, command=command, width=width, height=30,
                              fg_color="transparent", hover_color=RAISED, text_color=color,
@@ -658,6 +1162,21 @@ class App(ctk.CTk):
                              fg_color=LINE, progress_color=FILAMENT, button_color=FILAMENT,
                              button_hover_color=FILAMENT_HOVER, height=16, **kw)
 
+    def _segmented(self, parent, values, command, current):
+        seg = ctk.CTkSegmentedButton(parent, values=values, fg_color=RAISED, selected_color=FILAMENT,
+                                     selected_hover_color=FILAMENT_HOVER, unselected_color=RAISED,
+                                     unselected_hover_color=LINE, text_color=MOON, font=self.f_body,
+                                     corner_radius=10, height=32)
+        seg.set(current)
+        seg.configure(command=lambda v, s=seg: (command(v), self._recolor_segment(s)))
+        self._recolor_segment(seg)
+        return seg
+
+    def _recolor_segment(self, seg):
+        cur = seg.get()
+        for value, btn in getattr(seg, "_buttons_dict", {}).items():
+            btn.configure(text_color=NIGHT if value == cur else MOON)
+
     # ------------------------------------------------------------ header
     def _build_header(self):
         top = ctk.CTkFrame(self, fg_color="transparent")
@@ -668,16 +1187,35 @@ class App(ctk.CTk):
                                        font=self.f_button, fg_color=FILAMENT, hover_color=FILAMENT_HOVER,
                                        text_color=NIGHT, command=self._toggle)
         self.start_btn.pack(side="right")
-        self.preset_menu = self._menu(top, ["Presets"] + list(PRESETS), self._apply_preset, width=140)
-        self.preset_menu.set("Presets")
-        self.preset_menu.pack(side="right", padx=14)
+        self.source_seg = self._segmented(top, ["Screen", "Music"], self._pick_source,
+                                          self.settings["sync_source"])
+        self.source_seg.pack(side="right", padx=14)
+        self._label(top, "Sync to", muted=True).pack(side="right")
+
+    def _pick_source(self, value):
+        self.set("sync_source", value)
+        if self.source_seg.get() != value:
+            self.source_seg.set(value)
+        self._recolor_segment(self.source_seg)
+        if self._is_syncing():           # switch over right away
+            self._stop(restore=False)
+            self._start()
 
     # ------------------------------------------------------------ the room scene
     def _build_room(self):
         self.room_h = 250
         self.room = tk.Canvas(self, height=self.room_h, bg=NIGHT, highlightthickness=0, bd=0)
-        self.room.pack(fill="x", padx=0, pady=(10, 0))
-        self.room.bind("<Configure>", lambda e: self._draw_room(force=True))
+        self.room.pack(fill="x", pady=(10, 0))
+        self.room.bind("<Configure>", lambda e: self._draw_room())
+
+    def _bulb_look(self, ip):
+        """(rgb or None, dimming, words) for a bulb right now."""
+        if self._is_syncing():
+            col = self.engine.current.get(ip)
+            if col and col[3]:
+                return tuple(col[:3]), col[3], None
+            return None, 0, None
+        return self.display.get(ip, (None, 0, ""))
 
     def _room_bulbs(self, w, h, scale):
         bulbs = [(ip, b) for ip, b in sorted(self.settings["bulbs"].items()) if b.get("enabled", True)]
@@ -685,28 +1223,24 @@ class App(ctk.CTk):
         for i, (ip, b) in enumerate(bulbs):
             sides[bulb_side(b.get("zone", "Full screen"), i)].append((ip, b))
         out = []
-        syncing = self._is_syncing()
-        cur = self.engine.current if self.engine else {}
         mon_half = 125 * scale
         for side, items in sides.items():
             for j, (ip, b) in enumerate(items):
                 gap = 150 * scale + j * 150 * scale
                 x = w / 2 - mon_half - gap if side == "left" else w / 2 + mon_half + gap
-                col = cur.get(ip) if syncing else None
-                color = tuple(col[:3]) if col and col[3] else None
+                color, dim, words = self._bulb_look(ip)
                 out.append({"ip": ip, "name": b.get("name", ip), "zone": b.get("zone", "Full screen"),
-                            "x": int(x), "y": int(h * 0.36), "color": color,
-                            "dim": col[3] if col else 0})
+                            "x": int(x), "y": int(h * 0.36), "color": color, "dim": dim, "words": words})
         return out
 
-    def _draw_room(self, force=False):
+    def _draw_room(self):
         c = self.room
         w = max(200, c.winfo_width())
         h = max(150, c.winfo_height())
         scale = h / self.room_h
         bulbs = self._room_bulbs(w, h, scale)
         c.delete("all")
-        thumb = self.engine.preview if (self._is_syncing() and self.engine) else None
+        thumb = self.engine.preview if self._is_syncing() else None
         if PIL_OK:
             img, (mx0, my0, mw, mh) = render_room(w, h, bulbs, thumb, scale)
             self._hero_img = ImageTk.PhotoImage(img)
@@ -715,69 +1249,87 @@ class App(ctk.CTk):
             mw, mh = int(250 * scale), int(141 * scale)
             mx0, my0 = (w - mw) // 2, int(h * 0.40 - mh / 2)
             c.create_rectangle(mx0, my0, mx0 + mw, my0 + mh, fill=SURFACE, outline=LINE)
-            for b in bulbs:
-                r = 20 * scale
-                c.create_oval(b["x"] - r, b["y"] - r, b["x"] + r, b["y"] + r,
-                              fill=hex_color(b["color"]) if b["color"] else hex_color(OFF_BULB), outline="")
 
-        # words on the scene
         name_font = (self.display_bold, 13)
         info_font = (self.f_small.cget("family"), 10)
+        syncing = self._is_syncing()
         for b in bulbs:
             c.create_text(b["x"], b["y"] + 44 * scale, text=b["name"], fill=MOON, font=name_font)
-            detail = b["zone"] if not b["color"] else f"{b['zone']}, {b['dim']}%"
+            if syncing:
+                detail = b["zone"] if self.engine.kind == "Screen" else "Music"
+                if b["color"]:
+                    detail += f", {b['dim']}%"
+            else:
+                detail = b["words"] or ""
+                if b["color"] and b["words"] not in ("Off", ""):
+                    detail = f"{b['words']}, {b['dim']}%"
             c.create_text(b["x"], b["y"] + 64 * scale, text=detail, fill="#C9C0DC", font=info_font)
-        if self._is_syncing():
-            caption = f"Syncing at {self.engine.actual_fps:.0f} updates a second"
+
+        if syncing:
+            caption = f"{self.engine.kind} sync at {self.engine.actual_fps:.0f} updates a second"
         elif self.engine and self.engine.error:
-            caption = f"Stopped: {self.engine.error}"
+            caption = self.engine.error
+        elif self.fade_job and self.fade_job.is_alive():
+            caption = f"{self.fade_label}, {int(self.fade_job.progress * 100)}% done"
         elif not self.settings["bulbs"]:
             caption = "No bulbs yet. Find them on the Bulbs page."
         else:
-            caption = "Not syncing"
-        c.create_text(w / 2, my0 + mh + 46 * scale, text=caption, fill=MUTED, font=info_font)
+            caption = self.status_text or "Not syncing"
+        if self.sleep_deadline:
+            mins = max(0, int((self.sleep_deadline - time.time()) // 60) + 1)
+            caption += f". Lights off in {mins} min"
+        c.create_text(w / 2, my0 + mh + 46 * scale, text=caption, fill=MUTED, font=info_font,
+                      width=w - 80)
         if thumb is None:
-            c.create_text(w / 2, my0 + mh / 2, text="Your screen shows here while syncing",
-                          fill=MUTED, font=info_font, width=mw - 20, justify="center")
+            msg = "Your screen or music shows here while syncing"
+            c.create_text(w / 2, my0 + mh / 2, text=msg, fill=MUTED, font=info_font, width=mw - 30,
+                          justify="center")
 
     # ------------------------------------------------------------ body: sidebar + pages
     def _build_body(self):
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=20, pady=(6, 20))
 
-        nav = ctk.CTkFrame(body, fg_color="transparent", width=170)
+        nav = ctk.CTkFrame(body, fg_color="transparent", width=180)
         nav.pack(side="left", fill="y", padx=(0, 14))
         self.nav_buttons = {}
-        for name in self.PAGES:
-            row = ctk.CTkFrame(nav, fg_color="transparent")
-            row.pack(fill="x", pady=2)
-            bar = ctk.CTkFrame(row, width=3, height=34, corner_radius=2, fg_color="transparent")
-            bar.pack(side="left", padx=(0, 8))
-            btn = ctk.CTkButton(row, text=name, anchor="w", width=150, height=40, corner_radius=10,
-                                fg_color="transparent", hover_color=SURFACE, text_color=MUTED,
-                                font=self.f_nav, command=lambda n=name: self._show_page(n))
-            btn.pack(side="left", fill="x")
-            self.nav_buttons[name] = (btn, bar)
+        for gi, group in enumerate(self.NAV):
+            if gi:
+                ctk.CTkFrame(nav, height=1, fg_color=LINE).pack(fill="x", padx=(14, 10), pady=8)
+            for name in group:
+                row = ctk.CTkFrame(nav, fg_color="transparent")
+                row.pack(fill="x", pady=1)
+                bar = ctk.CTkFrame(row, width=3, height=32, corner_radius=2, fg_color="transparent")
+                bar.pack(side="left", padx=(0, 8))
+                btn = ctk.CTkButton(row, text=name, anchor="w", width=160, height=38, corner_radius=10,
+                                    fg_color="transparent", hover_color=SURFACE, text_color=MUTED,
+                                    font=self.f_nav, command=lambda n=name: self._show_page(n))
+                btn.pack(side="left", fill="x")
+                self.nav_buttons[name] = (btn, bar)
 
         self.page_host = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=16)
         self.page_host.pack(side="left", fill="both", expand=True)
         self.pages = {}
-        builders = {"Bulbs": self._build_bulbs_page, "Color": self._build_color_page,
-                    "Brightness": self._build_brightness_page, "Screen": self._build_screen_page,
+        builders = {"Control": self._build_control_page, "Scenes": self._build_scenes_page,
+                    "Schedules": self._build_schedules_page, "Screen sync": self._build_screen_page,
+                    "Music sync": self._build_music_page, "Bulbs": self._build_bulbs_page,
                     "App": self._build_app_page}
-        for name in self.PAGES:
-            frame = ctk.CTkFrame(self.page_host, fg_color="transparent")
-            builders[name](frame)
-            self.pages[name] = frame
+        for group in self.NAV:
+            for name in group:
+                frame = ctk.CTkFrame(self.page_host, fg_color="transparent")
+                builders[name](frame)
+                self.pages[name] = frame
 
     def _show_page(self, name):
-        for n, f in self.pages.items():
+        for f in self.pages.values():
             f.pack_forget()
         self.pages[name].pack(fill="both", expand=True, padx=6, pady=6)
         for n, (btn, bar) in self.nav_buttons.items():
             on = n == name
             btn.configure(text_color=MOON if on else MUTED, fg_color=SURFACE if on else "transparent")
             bar.configure(fg_color=FILAMENT if on else "transparent")
+        if name in ("Control", "Scenes"):
+            self._refresh_targets()
 
     def _scroll(self, parent):
         sf = ctk.CTkScrollableFrame(parent, fg_color="transparent", scrollbar_button_color=RAISED,
@@ -793,7 +1345,7 @@ class App(ctk.CTk):
             self._label(frame, note, muted=True, wraplength=620, justify="left").pack(anchor="w", pady=(0, 4))
         return frame
 
-    def _slider(self, parent, label, key, lo, hi, steps, fmt="{:.0f}", note=None):
+    def _slider(self, parent, label, key, lo, hi, steps, fmt="{:.0f}", note=None, on_change=None):
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=(8, 0))
         row.grid_columnconfigure(1, weight=1)
@@ -806,6 +1358,8 @@ class App(ctk.CTk):
             v = int(round(v)) if is_int else round(float(v), 2)
             lbl.configure(text=f.format(v))
             self.set(k, v)
+            if on_change:
+                on_change(v)
 
         sl = self._slider_widget(row, lo, hi, steps, changed)
         sl.set(self.settings[key])
@@ -820,26 +1374,13 @@ class App(ctk.CTk):
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=(8, 0))
         self._label(row, label, width=180, anchor="w").grid(row=0, column=0, sticky="w")
-        seg = ctk.CTkSegmentedButton(row, values=values, command=lambda v, k=key: self.set(k, v),
-                                     fg_color=RAISED, selected_color=FILAMENT,
-                                     selected_hover_color=FILAMENT_HOVER, unselected_color=RAISED,
-                                     unselected_hover_color=LINE, text_color=MOON,
-                                     font=self.f_body, corner_radius=10, height=32)
-        seg.set(self.settings[key])
+        seg = self._segmented(row, values, lambda v, k=key: self.set(k, v), self.settings[key])
         seg.grid(row=0, column=1, sticky="w", padx=14)
-        self._recolor_segment(seg)
-        seg.configure(command=lambda v, k=key, s=seg: (self.set(k, v), self._recolor_segment(s)))
         if note:
             self._label(row, note, muted=True, anchor="w", justify="left", wraplength=480).grid(
                 row=1, column=1, sticky="w", padx=14, pady=(4, 0))
         self.slider_widgets[key] = (seg, None, None)
         return seg
-
-    def _recolor_segment(self, seg):
-        """Dark text on the amber selected option, light text on the rest."""
-        cur = seg.get()
-        for value, btn in getattr(seg, "_buttons_dict", {}).items():
-            btn.configure(text_color=NIGHT if value == cur else MOON)
 
     def _switch(self, parent, label, key, command=None):
         var = ctk.BooleanVar(value=bool(self.settings[key]))
@@ -856,187 +1397,447 @@ class App(ctk.CTk):
         self.slider_widgets[key] = (sw, var, None)
         return sw
 
-    # ---- Bulbs page
-    def _build_bulbs_page(self, page):
-        bar = ctk.CTkFrame(page, fg_color="transparent")
-        bar.pack(fill="x", padx=18, pady=(16, 0))
-        ctk.CTkLabel(bar, text="Your bulbs", font=self.f_head, text_color=MOON).pack(side="left")
-        self.find_btn = ctk.CTkButton(bar, text="Find bulbs", width=110, height=32, corner_radius=10,
-                                      fg_color=RAISED, hover_color=LINE, text_color=MOON,
-                                      font=self.f_body, command=self._discover)
-        self.find_btn.pack(side="right")
-        ctk.CTkButton(bar, text="Add", width=60, height=32, corner_radius=10, fg_color=RAISED,
-                      hover_color=LINE, text_color=MOON, font=self.f_body,
-                      command=self._add_ip).pack(side="right", padx=(6, 12))
-        self.ip_entry = ctk.CTkEntry(bar, width=150, height=32, corner_radius=10, fg_color=RAISED,
-                                     border_width=0, text_color=MOON, placeholder_text="Add by IP address",
-                                     placeholder_text_color=MUTED, font=self.f_body)
-        self.ip_entry.pack(side="right")
-        self.discover_label = self._label(page, "Pick the part of the screen each bulb follows. "
-                                                "Left half and Right half split the screen between two bulbs.",
-                                          muted=True, anchor="w", justify="left", wraplength=640)
-        self.discover_label.pack(fill="x", padx=18, pady=(4, 6))
-        self.bulb_list = self._scroll(page)
+    # ------------------------------------------------------------ targets and direct commands
+    def _target_map(self):
+        """Menu label -> list of bulb IPs."""
+        bulbs = [(ip, b) for ip, b in sorted(self.settings["bulbs"].items()) if b.get("enabled", True)]
+        out = {"All bulbs": [ip for ip, _ in bulbs]}
+        for ip, b in bulbs:
+            name = b.get("name", ip)
+            out[name if name not in out else f"{name} ({ip})"] = [ip]
+        return out
 
-    def _refresh_bulb_rows(self):
-        for w in self.bulb_list.winfo_children():
-            w.destroy()
-        self.bulb_rows.clear()
-        bulbs = self.settings["bulbs"]
-        if not bulbs:
-            self._label(self.bulb_list, "No bulbs found yet. Click Find bulbs, or add one by its IP address.",
-                        muted=True).pack(pady=40)
-        for i, (ip, b) in enumerate(sorted(bulbs.items())):
-            b.setdefault("name", f"Bulb {i + 1}")
-            b.setdefault("enabled", True)
-            b.setdefault("zone", "Full screen")
-            b.setdefault("brightness_scale", 100)
+    def _refresh_targets(self):
+        values = list(self._target_map())
+        for menu in (getattr(self, "control_target", None), getattr(self, "scene_target", None)):
+            if menu:
+                menu.configure(values=values)
+                if menu.get() not in values:
+                    menu.set("All bulbs")
 
-            row = ctk.CTkFrame(self.bulb_list, fg_color=NIGHT, corner_radius=12)
-            row.pack(fill="x", padx=12, pady=5)
-            row.grid_columnconfigure(3, weight=1)
+    def _ips_for(self, label):
+        return self._target_map().get(label, self._target_map()["All bulbs"])
 
-            dot = ctk.CTkFrame(row, width=18, height=18, corner_radius=9, fg_color=hex_color(OFF_BULB))
-            dot.grid(row=0, column=0, rowspan=2, padx=(16, 12), pady=14)
-            name = ctk.CTkEntry(row, width=170, height=30, fg_color="transparent", border_width=0,
-                                text_color=MOON, font=ctk.CTkFont(family=self.display_bold, size=15))
-            name.insert(0, b["name"])
-            name.bind("<KeyRelease>", lambda e, ip=ip, w=name: self.set_bulb(ip, "name", w.get()))
-            name.grid(row=0, column=1, sticky="w", pady=(10, 0))
-            self._label(row, ip, muted=True).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(0, 10))
+    def _take_over(self):
+        """Direct control wins: stop any sync or fade first."""
+        if self.fade_job and self.fade_job.is_alive():
+            self.fade_job.cancel()
+        if self._is_syncing():
+            self._stop(restore=False)
 
-            zone = self._menu(row, ZONES, lambda v, ip=ip: self.set_bulb(ip, "zone", v), width=150)
-            zone.set(b["zone"])
-            zone.grid(row=0, column=2, rowspan=2, padx=10)
-
-            bri = ctk.CTkFrame(row, fg_color="transparent")
-            bri.grid(row=0, column=3, rowspan=2, sticky="ew", padx=6)
-            bri.grid_columnconfigure(0, weight=1)
-            scale_lbl = ctk.CTkLabel(bri, text=f"{b['brightness_scale']}%", width=44, anchor="e",
-                                     font=self.f_num, text_color=FILAMENT)
-            sl = self._slider_widget(bri, 10, 100, 18, lambda v, ip=ip, l=scale_lbl: (
-                l.configure(text=f"{int(v)}%"), self.set_bulb(ip, "brightness_scale", int(v))))
-            sl.set(b["brightness_scale"])
-            sl.grid(row=0, column=0, sticky="ew")
-            scale_lbl.grid(row=0, column=1, padx=(6, 0))
-            self._label(bri, "Brightness limit", muted=True).grid(row=1, column=0, sticky="w")
-
-            en = ctk.BooleanVar(value=b["enabled"])
-            ctk.CTkSwitch(row, text="", variable=en, width=46, switch_width=42, switch_height=22,
-                          fg_color=LINE, progress_color=FILAMENT, button_color=MOON,
-                          command=lambda ip=ip, v=en: self.set_bulb(ip, "enabled", bool(v.get()))
-                          ).grid(row=0, column=4, rowspan=2, padx=(10, 0))
-            acts = ctk.CTkFrame(row, fg_color="transparent")
-            acts.grid(row=0, column=5, rowspan=2, padx=(0, 10))
-            self._ghost_button(acts, "Identify", lambda ip=ip: self._identify(ip), width=70).pack()
-            self._ghost_button(acts, "Remove", lambda ip=ip: self._remove_bulb(ip), color=ROSE,
-                               width=70).pack()
-            self.bulb_rows[ip] = {"swatch": dot}
-
-    def _discover(self):
-        self.find_btn.configure(state="disabled", text="Searching")
-        self.discover_label.configure(text="Searching your network for WiZ bulbs.")
-
-        def work():
-            found = discover_bulbs()
-            self.after(0, lambda: self._discover_done(found))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _discover_done(self, found):
-        self.find_btn.configure(state="normal", text="Find bulbs")
-        with self.lock:
-            known = self.settings["bulbs"]
-            new = [ip for ip in found if ip not in known]
-            for ip in sorted(new):
-                known[ip] = {"name": f"Bulb {len(known) + 1}", "enabled": True,
-                             "zone": "Full screen", "brightness_scale": 100}
-        self._schedule_save()
-        if found:
-            self.discover_label.configure(text=f"Found {len(found)} bulbs, {len(new)} of them new.")
+    def _command(self, ips, params, look, status, throttle=False):
+        """Send params to the bulbs and remember how they look for the room picture."""
+        self._take_over()
+        if not status.endswith("scene") and getattr(self, "_scene_btns", None):
+            self._clear_scene()
+        for ip in ips:
+            self.display[ip] = look
+        self.status_text = status
+        if throttle:   # dragging a slider or the wheel: at most ~15 sends a second
+            self._pending_cmd = (list(ips), dict(params))
+            if not self._cmd_job:
+                self._cmd_job = self.after(70, self._flush_cmd)
         else:
-            self.discover_label.configure(
-                text="No bulbs answered. Check that this PC and the bulbs are on the same Wi-Fi, "
-                     "and that local communication is on in the WiZ app.")
-        self._refresh_bulb_rows()
-        self._draw_room(force=True)
+            for ip in ips:
+                bulb_send(self.cmd_sock, ip, params)
+        self._draw_room()
+        self._paint_dots()
 
-    def _add_ip(self):
-        ip = self.ip_entry.get().strip()
-        try:
-            socket.inet_aton(ip)
-        except OSError:
-            self.discover_label.configure(text=f"{ip or 'That'} is not an IP address. It should look like 192.168.1.50.")
-            return
-        with self.lock:
-            self.settings["bulbs"].setdefault(ip, {"name": f"Bulb {len(self.settings['bulbs']) + 1}",
-                                                    "enabled": True, "zone": "Full screen",
-                                                    "brightness_scale": 100})
-        self._schedule_save()
-        self.ip_entry.delete(0, "end")
-        self._refresh_bulb_rows()
+    def _flush_cmd(self):
+        self._cmd_job = None
+        if self._pending_cmd:
+            ips, params = self._pending_cmd
+            self._pending_cmd = None
+            for ip in ips:
+                bulb_send(self.cmd_sock, ip, params)
 
-    def _remove_bulb(self, ip):
-        with self.lock:
-            self.settings["bulbs"].pop(ip, None)
-        self._schedule_save()
-        self._refresh_bulb_rows()
-
-    def _identify(self, ip):
-        """Flash the bulb soft yellow at 50% once. Works while syncing too."""
-        name = self.settings["bulbs"].get(ip, {}).get("name", ip)
-        self.discover_label.configure(text=f"{name} flashed soft yellow.")
-        engine = self.engine if self._is_syncing() else None
-        flash_for = 0.7
-        if engine:
-            engine.hold_until[ip] = time.time() + flash_for + 0.1
+    def _poll_states(self):
+        """Ask each bulb how it looks right now (used when nothing is syncing)."""
+        ips = list(self.settings["bulbs"])
 
         def work():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(0.5)
-            state = None if engine else bulb_get_state(sock, ip)
-            bulb_send(sock, ip, {"state": True, "r": 255, "g": 200, "b": 80, "c": 0, "w": 0,
-                                 "dimming": 50})   # soft yellow, half brightness
-            time.sleep(flash_for)
-            if engine:
-                engine.hold_until.pop(ip, None)    # the sync takes the bulb back
-            else:
-                params = restore_params(state)
-                if params:
-                    bulb_send(sock, ip, params)
+            sock.settimeout(0.4)
+            found = {ip: state_to_display(bulb_get_state(sock, ip)) for ip in ips}
             sock.close()
+            self.ui_queue.put(lambda: (self.display.update(found), self._draw_room(), self._paint_dots()))
 
         threading.Thread(target=work, daemon=True).start()
 
-    # ---- Color page
-    def _build_color_page(self, page):
+    def _paint_dots(self):
+        for ip, row in self.bulb_rows.items():
+            color, dim, _ = self._bulb_look(ip)
+            row["swatch"].configure(fg_color=hex_color(color) if color else hex_color(OFF_BULB))
+
+    # ---- Control page
+    def _build_control_page(self, page):
+        top = ctk.CTkFrame(page, fg_color="transparent")
+        top.pack(fill="x", padx=18, pady=(16, 6))
+        ctk.CTkLabel(top, text="Control", font=self.f_head, text_color=MOON).pack(side="left")
+        self.control_target = self._menu(top, list(self._target_map()), lambda v: self.set("control_target", v),
+                                         width=180)
+        self.control_target.set(self.settings["control_target"])
+        self.control_target.pack(side="left", padx=16)
+        self._button(top, "Turn off", lambda: self._power(False), width=96).pack(side="right")
+        self._button(top, "Turn on", lambda: self._power(True), width=96, primary=True).pack(side="right", padx=8)
+
+        body = ctk.CTkFrame(page, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=18, pady=(4, 12))
+        left = ctk.CTkFrame(body, fg_color="transparent")
+        left.pack(side="left", padx=(0, 28), anchor="n")
+        if PIL_OK:
+            self.wheel = ColorWheel(left, size=210, command=self._pick_color)
+            self.wheel.pack()
+            self.wheel.set_color(tuple(self.settings["control_color"]))
+        right = ctk.CTkFrame(body, fg_color="transparent")
+        right.pack(side="left", fill="both", expand=True, anchor="n")
+
+        self._label(right, "Colors", font=self.f_head).pack(anchor="w")
+        sw_row = ctk.CTkFrame(right, fg_color="transparent")
+        sw_row.pack(anchor="w", pady=(6, 14))
+        for rgb in QUICK_COLORS:
+            ctk.CTkButton(sw_row, text="", width=34, height=34, corner_radius=17, fg_color=hex_color(rgb),
+                          hover_color=hex_color(rgb), border_width=0,
+                          command=lambda c=rgb: (self.wheel.set_color(c) if PIL_OK else None,
+                                                 self._pick_color(c, throttle=False))).pack(side="left", padx=3)
+
+        self._label(right, "Whites", font=self.f_head).pack(anchor="w")
+        wrow = ctk.CTkFrame(right, fg_color="transparent")
+        wrow.pack(fill="x", pady=(6, 0))
+        wrow.grid_columnconfigure(0, weight=1)
+        kbar = tk.Canvas(wrow, height=8, bg=SURFACE, highlightthickness=0, bd=0)
+        kbar.grid(row=0, column=0, sticky="ew", padx=10, pady=(0, 4))
+
+        def paint_kbar(e, c=kbar):
+            c.delete("all")
+            w = max(10, e.width)
+            for x in range(0, w, 3):
+                k = MIN_KELVIN + (MAX_KELVIN - MIN_KELVIN) * x / max(1, w - 1)
+                c.create_rectangle(x, 0, x + 3, 8, fill=hex_color(kelvin_to_rgb(k)), width=0)
+
+        kbar.bind("<Configure>", paint_kbar)
+        self.k_label = ctk.CTkLabel(wrow, text=f"{self.settings['control_kelvin']}K", width=70, anchor="e",
+                                    font=self.f_num, text_color=FILAMENT)
+        self.k_label.grid(row=1, column=1)
+        self.k_slider = self._slider_widget(wrow, MIN_KELVIN, MAX_KELVIN, 43, self._pick_white)
+        self.k_slider.set(self.settings["control_kelvin"])
+        self.k_slider.grid(row=1, column=0, sticky="ew")
+        qrow = ctk.CTkFrame(right, fg_color="transparent")
+        qrow.pack(anchor="w", pady=(6, 14))
+        for k, name in zip(QUICK_WHITES, ("Candle", "Warm", "Neutral", "Daylight")):
+            self._ghost_button(qrow, name, lambda k=k: (self.k_slider.set(k), self._pick_white(k, throttle=False)),
+                               color=MOON, width=80).pack(side="left", padx=(0, 4))
+
+        self._label(right, "Brightness", font=self.f_head).pack(anchor="w")
+        brow = ctk.CTkFrame(right, fg_color="transparent")
+        brow.pack(fill="x", pady=(6, 0))
+        brow.grid_columnconfigure(0, weight=1)
+        self.b_label = ctk.CTkLabel(brow, text=f"{self.settings['control_brightness']}%", width=70, anchor="e",
+                                    font=self.f_num, text_color=FILAMENT)
+        self.b_slider = self._slider_widget(brow, 10, 100, 90, self._pick_brightness)
+        self.b_slider.set(self.settings["control_brightness"])
+        self.b_slider.grid(row=0, column=0, sticky="ew")
+        self.b_label.grid(row=0, column=1)
+        self._label(right, "Changes here stop screen or music sync so the bulbs stay how you set them.",
+                    muted=True, wraplength=460, justify="left").pack(anchor="w", pady=(16, 0))
+        self._last_mode = "color"
+
+    def _control_ips(self):
+        return self._ips_for(self.control_target.get())
+
+    def _pick_color(self, rgb, throttle=True):
+        self.set("control_color", list(rgb))
+        self._last_mode = "color"
+        dim = self.settings["control_brightness"]
+        self._command(self._control_ips(), {"state": True, "r": rgb[0], "g": rgb[1], "b": rgb[2],
+                                            "c": 0, "w": 0, "dimming": dim},
+                      (rgb, dim, "Color"), "Manual color", throttle)
+
+    def _pick_white(self, k, throttle=True):
+        k = int(round(k / 100) * 100)
+        self.k_label.configure(text=f"{k}K")
+        self.set("control_kelvin", k)
+        self._last_mode = "white"
+        dim = self.settings["control_brightness"]
+        self._command(self._control_ips(), {"state": True, "temp": k, "dimming": dim},
+                      (kelvin_to_rgb(k), dim, f"White {k}K"), "Manual white", throttle)
+
+    def _pick_brightness(self, v):
+        v = int(v)
+        self.b_label.configure(text=f"{v}%")
+        self.set("control_brightness", v)
+        ips = self._control_ips()
+        look = self.display.get(ips[0], (None, v, "")) if ips else (None, v, "")
+        self._command(ips, {"state": True, "dimming": v}, (look[0] or (255, 200, 140), v, look[2] or "On"),
+                      "Manual brightness", throttle=True)
+
+    def _power(self, on):
+        ips = self._control_ips()
+        if on:
+            dim = self.settings["control_brightness"]
+            if self._last_mode == "white":
+                k = self.settings["control_kelvin"]
+                self._command(ips, {"state": True, "temp": k, "dimming": dim},
+                              (kelvin_to_rgb(k), dim, f"White {k}K"), "Turned on")
+            else:
+                rgb = tuple(self.settings["control_color"])
+                self._command(ips, {"state": True, "r": rgb[0], "g": rgb[1], "b": rgb[2], "c": 0, "w": 0,
+                                    "dimming": dim}, (rgb, dim, "Color"), "Turned on")
+        else:
+            self._command(ips, {"state": False}, (None, 0, "Off"), "Turned off")
+
+    # ---- Scenes page
+    def _build_scenes_page(self, page):
+        top = ctk.CTkFrame(page, fg_color="transparent")
+        top.pack(fill="x", padx=18, pady=(16, 0))
+        ctk.CTkLabel(top, text="WiZ scenes", font=self.f_head, text_color=MOON).pack(side="left")
+        self.scene_target = self._menu(top, list(self._target_map()), lambda v: None, width=180)
+        self.scene_target.set("All bulbs")
+        self.scene_target.pack(side="left", padx=16)
+        self.scene_now = self._label(top, "", muted=True)
+        self.scene_now.pack(side="right")
+
         sf = self._scroll(page)
+        ctl = ctk.CTkFrame(sf, fg_color="transparent")
+        ctl.pack(fill="x", padx=18, pady=(4, 0))
+        self._slider(ctl, "Speed", "scene_speed", 10, 200, 19, "{:.0f}%",
+                     "How fast moving scenes change. Still scenes ignore it.",
+                     on_change=lambda v: self._resend_scene())
+        self._slider(ctl, "Brightness", "scene_brightness", 10, 100, 90, "{:.0f}%",
+                     on_change=lambda v: self._resend_scene())
+        self._scene_imgs = {}
+        self._scene_btns = {}
+        self._current_scene = None
+        for title, ids in SCENE_GROUPS:
+            g = self._group(sf, title)
+            grid = ctk.CTkFrame(g, fg_color="transparent")
+            grid.pack(fill="x", pady=(6, 0))
+            for i, sid in enumerate(ids):
+                img = None
+                if PIL_OK:
+                    pil = scene_chip(sid)
+                    img = ctk.CTkImage(light_image=pil, dark_image=pil, size=(22, 22))
+                    self._scene_imgs[sid] = img
+                btn = ctk.CTkButton(grid, text=SCENES[sid], image=img, compound="left", anchor="w", width=150,
+                                    height=40, corner_radius=10, fg_color=NIGHT, hover_color=RAISED,
+                                    text_color=MOON, font=self.f_body, border_width=2, border_color=NIGHT,
+                                    command=lambda s=sid: self._play_scene(s))
+                btn.grid(row=i // 4, column=i % 4, padx=4, pady=4, sticky="w")
+                self._scene_btns[sid] = btn
+
+    def _play_scene(self, sid, ips=None):
+        ips = ips or self._ips_for(self.scene_target.get())
+        dim, speed = self.settings["scene_brightness"], self.settings["scene_speed"]
+        params = {"state": True, "sceneId": sid, "dimming": dim}
+        if sid not in STATIC_SCENES:
+            params["speed"] = speed
+        self._current_scene = (sid, ips)
+        self.scene_now.configure(text=f"Playing {SCENES[sid]}")
+        for other, btn in self._scene_btns.items():
+            btn.configure(border_color=FILAMENT if other == sid else NIGHT)
+        self._command(ips, params, (SCENE_LOOK[sid][0], dim, SCENES[sid]), f"{SCENES[sid]} scene")
+
+    def _clear_scene(self):
+        self._current_scene = None
+        self.scene_now.configure(text="")
+        for btn in self._scene_btns.values():
+            btn.configure(border_color=NIGHT)
+
+    def _resend_scene(self):
+        if self._current_scene and not self._is_syncing():
+            sid, ips = self._current_scene
+            dim, speed = self.settings["scene_brightness"], self.settings["scene_speed"]
+            params = {"state": True, "sceneId": sid, "dimming": dim}
+            if sid not in STATIC_SCENES:
+                params["speed"] = speed
+            self._command(ips, params, (SCENE_LOOK[sid][0], dim, SCENES[sid]), f"{SCENES[sid]} scene",
+                          throttle=True)
+
+    # ---- Schedules page
+    def _build_schedules_page(self, page):
+        sf = self._scroll(page)
+        g = self._group(sf, "Sleep timer", "Fades all bulbs out over a minute and turns them off.")
+        row = ctk.CTkFrame(g, fg_color="transparent")
+        row.pack(fill="x", pady=(8, 0))
+        for m in (15, 30, 60, 90):
+            self._button(row, f"{m} min", lambda m=m: self._set_sleep(m), width=80).pack(side="left", padx=(0, 6))
+        self._ghost_button(row, "Cancel", lambda: self._set_sleep(None), color=ROSE).pack(side="left", padx=6)
+        self.sleep_label = self._label(row, "", muted=True)
+        self.sleep_label.pack(side="left", padx=10)
+
+        g = self._group(sf, "Schedules", "These run while the app is open, including when it is in the tray. "
+                                         "Turn on Open at Windows login on the App page so they always run.")
+        head = ctk.CTkFrame(g, fg_color="transparent")
+        head.pack(fill="x")
+        self._button(head, "Add schedule", lambda: ScheduleDialog(self), width=130, primary=True).pack(
+            side="left", pady=(8, 4))
+        self.sched_list = ctk.CTkFrame(g, fg_color="transparent")
+        self.sched_list.pack(fill="x", pady=(6, 0))
+        self._refresh_schedules()
+
+    def _refresh_schedules(self):
+        for w in self.sched_list.winfo_children():
+            w.destroy()
+        items = sorted(self.settings["schedules"], key=lambda s: s["time"])
+        if not items:
+            self._label(self.sched_list, "No schedules yet. Add one to wake up to light, wind down at bedtime, "
+                                         "or start syncing at a set time.", muted=True,
+                        wraplength=600, justify="left").pack(anchor="w", pady=10)
+        for sc in items:
+            row = ctk.CTkFrame(self.sched_list, fg_color=NIGHT, corner_radius=12)
+            row.pack(fill="x", pady=4)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(row, text=time_text(sc["time"]), font=self.f_big, width=120, anchor="w",
+                         text_color=MOON if sc.get("enabled", True) else MUTED).grid(
+                row=0, column=0, rowspan=2, padx=(16, 8), pady=10, sticky="w")
+            self._label(row, action_text(sc)).grid(row=0, column=1, sticky="w", pady=(10, 0))
+            self._label(row, f"{days_text(sc['days'])}, {sc.get('target', 'All bulbs')}", muted=True).grid(
+                row=1, column=1, sticky="w", pady=(0, 10))
+            var = ctk.BooleanVar(value=sc.get("enabled", True))
+            ctk.CTkSwitch(row, text="", variable=var, width=46, switch_width=42, switch_height=22,
+                          fg_color=LINE, progress_color=FILAMENT, button_color=MOON,
+                          command=lambda s=sc, v=var: self._toggle_schedule(s["id"], bool(v.get()))
+                          ).grid(row=0, column=2, rowspan=2, padx=6)
+            self._ghost_button(row, "Edit", lambda s=sc: ScheduleDialog(self, s), color=MOON, width=60).grid(
+                row=0, column=3, rowspan=2)
+            self._ghost_button(row, "Delete", lambda s=sc: self._delete_schedule(s["id"]), color=ROSE,
+                               width=60).grid(row=0, column=4, rowspan=2, padx=(0, 10))
+
+    def _save_schedule(self, sc):
+        with self.lock:
+            items = [x for x in self.settings["schedules"] if x["id"] != sc["id"]]
+            items.append(sc)
+            self.settings["schedules"] = items
+        self._schedule_save()
+        self._refresh_schedules()
+
+    def _toggle_schedule(self, sid, on):
+        with self.lock:
+            for x in self.settings["schedules"]:
+                if x["id"] == sid:
+                    x["enabled"] = on
+        self._schedule_save()
+        self._refresh_schedules()
+
+    def _delete_schedule(self, sid):
+        with self.lock:
+            self.settings["schedules"] = [x for x in self.settings["schedules"] if x["id"] != sid]
+        self._schedule_save()
+        self._refresh_schedules()
+
+    def _check_schedules(self):
+        now = time.localtime()
+        hhmm, today = f"{now.tm_hour:02d}:{now.tm_min:02d}", time.strftime("%Y-%m-%d", now)
+        for sc in self.settings["schedules"]:
+            key = (sc["id"], today, hhmm)
+            if sc.get("enabled", True) and sc["time"] == hhmm and now.tm_wday in sc["days"] \
+                    and key not in self._fired:
+                self._fired.add(key)
+                self._run_action(sc)
+
+    def _run_action(self, sc):
+        a, v = sc["action"], sc.get("value", {})
+        ips = self._ips_for(sc.get("target", "All bulbs"))
+        dim = v.get("brightness", 80)
+        if a == "Turn on":
+            self._command(ips, {"state": True, "dimming": dim}, ((255, 200, 140), dim, "On"), "Schedule: turned on")
+        elif a == "Turn off":
+            self._command(ips, {"state": False}, (None, 0, "Off"), "Schedule: turned off")
+        elif a == "Set white":
+            k = v.get("kelvin", 3000)
+            self._command(ips, {"state": True, "temp": k, "dimming": dim}, (kelvin_to_rgb(k), dim, f"White {k}K"),
+                          "Schedule: white")
+        elif a == "Set color":
+            rgb = tuple(v.get("color", (255, 140, 60)))
+            self._command(ips, {"state": True, "r": rgb[0], "g": rgb[1], "b": rgb[2], "c": 0, "w": 0,
+                                "dimming": dim}, (rgb, dim, "Color"), "Schedule: color")
+        elif a == "Play scene":
+            sid = v.get("scene", 1)
+            params = {"state": True, "sceneId": sid, "dimming": dim}
+            if sid not in STATIC_SCENES:
+                params["speed"] = v.get("speed", 100)
+            self._command(ips, params, (SCENE_LOOK[sid][0], dim, SCENES[sid]), f"Schedule: {SCENES[sid]}")
+        elif a == "Wake-up fade":
+            self._start_fade(ips, v.get("minutes", 30), 10, 100, 2200, 5000, False, "Wake-up fade")
+        elif a == "Bedtime fade":
+            self._start_fade(ips, v.get("minutes", 30), 60, 10, 2700, 2200, True, "Bedtime fade")
+        elif a in ("Start screen sync", "Start music sync"):
+            src = "Screen" if "screen" in a else "Music"
+            self.set("sync_source", src)
+            self.source_seg.set(src)
+            self._recolor_segment(self.source_seg)
+            if self._is_syncing():
+                self._stop(restore=False)
+            self._start()
+        elif a == "Stop sync":
+            if self._is_syncing():
+                self._stop()
+
+    def _start_fade(self, ips, minutes, d0, d1, k0, k1, off, label):
+        self._take_over()
+        self.fade_label = label
+
+        def done():
+            self.ui_queue.put(lambda: self._fade_done(ips, off, k1, d1))
+
+        self.fade_job = FadeJob(ips, minutes, d0, d1, k0, k1, turn_off_at_end=off, on_done=done)
+        self.fade_job.start()
+        self.status_text = label
+
+    def _fade_done(self, ips, off, k, d):
+        for ip in ips:
+            self.display[ip] = (None, 0, "Off") if off else (kelvin_to_rgb(k), d, f"White {k}K")
+        self.status_text = "Lights off" if off else "Wake-up fade finished"
+        self._draw_room()
+        self._paint_dots()
+
+    def _set_sleep(self, minutes):
+        if minutes is None:
+            self.sleep_deadline = None
+            self.sleep_label.configure(text="")
+        else:
+            self.sleep_deadline = time.time() + minutes * 60
+            off_at = time.strftime("%I:%M %p", time.localtime(self.sleep_deadline)).lstrip("0")
+            self.sleep_label.configure(text=f"Lights off at {off_at}")
+        self._draw_room()
+
+    def _sleep_now(self):
+        self.sleep_deadline = None
+        self.sleep_label.configure(text="")
+        ips = self._target_map()["All bulbs"]
+        if self._is_syncing():
+            self._stop(restore=False)
+        self._start_fade(ips, 1, 50, 10, 2700, 2200, True, "Sleep timer")
+
+    # ---- Screen sync page (was Color, Brightness and Screen)
+    def _build_screen_page(self, page):
+        sf = self._scroll(page)
+        top = ctk.CTkFrame(sf, fg_color="transparent")
+        top.pack(fill="x", padx=18, pady=(14, 0))
+        ctk.CTkLabel(top, text="Screen sync", font=self.f_head, text_color=MOON).pack(side="left")
+        self.preset_menu = self._menu(top, ["Presets"] + list(PRESETS), self._apply_preset, width=140)
+        self.preset_menu.set("Presets")
+        self.preset_menu.pack(side="right")
+
         g = self._group(sf, "Color", "How the app turns your screen into one color for each bulb.")
         self._choice(g, "Color mode", "color_mode", COLOR_MODES,
-                     "Vivid lets strong colors win over gray. Average uses the true "
-                     "average of the screen. Dominant uses the most common strong color.")
+                     "Vivid lets strong colors win over gray. Average uses the true average of the screen. "
+                     "Dominant uses the most common strong color, good for movies and games.")
         self._slider(g, "Color intensity", "saturation", 0.5, 3.0, 25, "{:.1f}x",
                      "1.0x shows the screen's real colors. Higher makes pale colors bolder.")
-        g = self._group(sf, "Motion", "How quickly the bulbs react.")
+        g = self._group(sf, "Motion")
         self._slider(g, "Smoothing", "smoothing", 0.0, 0.95, 19, "{:.2f}",
                      "0 reacts instantly. 0.9 fades slowly and calmly.")
-        self._slider(g, "Updates per second", "fps", 1, 20, 19, "{:.0f}",
-                     "WiZ bulbs keep up with 10 to 20.")
+        self._slider(g, "Updates per second", "fps", 1, 20, 19, "{:.0f}", "WiZ bulbs keep up with 10 to 20.")
         self._slider(g, "Ignore small changes", "change_threshold", 0, 20, 20, "{:.0f}",
                      "Skips tiny shifts to reduce flicker and Wi-Fi traffic.")
-
-    # ---- Brightness page
-    def _build_brightness_page(self, page):
-        sf = self._scroll(page)
         g = self._group(sf, "Brightness")
         self._choice(g, "Mode", "brightness_mode", BRIGHTNESS_MODES)
-        self._slider(g, "Lowest", "min_brightness", 10, 100, 90, "{:.0f}%",
-                     "How dim the bulbs get in dark scenes.")
+        self._slider(g, "Lowest", "min_brightness", 10, 100, 90, "{:.0f}%", "How dim the bulbs get in dark scenes.")
         self._slider(g, "Highest", "max_brightness", 10, 100, 90, "{:.0f}%")
         self._slider(g, "Response", "brightness_gain", 0.5, 6.0, 22, "{:.1f}x",
                      "Higher reaches full brightness on dimmer scenes.")
-        self._slider(g, "Fixed level", "fixed_brightness", 10, 100, 90, "{:.0f}%",
-                     "Used when Brightness is set to Fixed.")
+        self._slider(g, "Fixed level", "fixed_brightness", 10, 100, 90, "{:.0f}%", "Used when Mode is Fixed.")
         g = self._group(sf, "Dark scenes", "What the bulbs do when the screen is almost black.")
         row = ctk.CTkFrame(g, fg_color="transparent")
         row.pack(fill="x", pady=(8, 0))
@@ -1046,10 +1847,6 @@ class App(ctk.CTk):
         om.pack(side="left", padx=14)
         self.slider_widgets["dark_scene"] = (om, None, None)
         self._slider(g, "Counts as dark below", "dark_threshold", 0.0, 0.2, 20, "{:.2f}")
-
-    # ---- Screen page
-    def _build_screen_page(self, page):
-        sf = self._scroll(page)
         g = self._group(sf, "Monitor")
         row = ctk.CTkFrame(g, fg_color="transparent")
         row.pack(fill="x", pady=(8, 0))
@@ -1060,17 +1857,16 @@ class App(ctk.CTk):
         self.monitor_menu.set(names[idx - 1] if 0 < idx <= len(names) else names[0])
         self.monitor_menu.pack(side="left", padx=14)
         self._ghost_button(row, "Refresh list", self._refresh_monitors, color=MOON, width=100).pack(side="left")
-
         g = self._group(sf, "Capture area", "Leave out parts of the screen, such as the taskbar.")
         self._switch(g, "Ignore black bars on movies", "ignore_black_bars")
         self._slider(g, "Ignore top", "crop_top", 0, 40, 40, "{:.0f}%")
         self._slider(g, "Ignore bottom", "crop_bottom", 0, 40, 40, "{:.0f}%")
         self._slider(g, "Ignore left", "crop_left", 0, 40, 40, "{:.0f}%")
         self._slider(g, "Ignore right", "crop_right", 0, 40, 40, "{:.0f}%")
-
         g = self._group(sf, "Performance")
         self._slider(g, "Pixel sampling", "sample_step", 2, 24, 22, "1 in {:.0f}",
                      "Reads every Nth pixel. Higher uses less CPU and looks the same.")
+        ctk.CTkFrame(sf, height=16, fg_color="transparent").pack()
 
     def _monitor_names(self):
         try:
@@ -1096,15 +1892,196 @@ class App(ctk.CTk):
         idx = self.settings["monitor"]
         self.monitor_menu.set(names[idx - 1] if 0 < idx <= len(names) else names[0])
 
+    # ---- Music sync page
+    def _build_music_page(self, page):
+        sf = self._scroll(page)
+        g = self._group(sf, "Music sync", "The bulbs react to whatever is playing on this PC: Spotify, YouTube, "
+                                          "games. Pick Music next to Start sync at the top.")
+        if not self._soundcard_ok():
+            ctk.CTkLabel(g, text="Music sync needs one more package. Run  pip install soundcard  and restart "
+                                 "the app.", wraplength=620, justify="left", text_color=ROSE,
+                         font=self.f_body).pack(anchor="w", pady=(4, 0))
+        self._choice(g, "Style", "music_mode", MUSIC_MODES,
+                     "Beat pulse jumps to a new color on each beat. Spectrum mixes bass as red, mids as green "
+                     "and highs as blue. Mellow drifts slowly and breathes with the volume.")
+        self._choice(g, "Colors", "music_palette", list(MUSIC_PALETTES),
+                     "The range of colors Beat pulse and Mellow move through.")
+        self._switch(g, "Give each bulb a different color", "music_split_colors")
+        g = self._group(sf, "Response")
+        self._slider(g, "Beat sensitivity", "music_sensitivity", 0.4, 2.0, 16, "{:.1f}x",
+                     "Higher catches softer beats. Lower reacts only to strong kicks.")
+        self._slider(g, "Smoothing", "music_smoothing", 0.0, 0.9, 18, "{:.2f}")
+        self._slider(g, "Updates per second", "music_fps", 4, 20, 16, "{:.0f}")
+        g = self._group(sf, "Brightness")
+        self._slider(g, "Quiet parts", "music_min_brightness", 10, 100, 90, "{:.0f}%")
+        self._slider(g, "Loud parts", "music_max_brightness", 10, 100, 90, "{:.0f}%")
+        ctk.CTkFrame(sf, height=16, fg_color="transparent").pack()
+
+    def _soundcard_ok(self):
+        try:
+            import importlib.util
+            return importlib.util.find_spec("soundcard") is not None
+        except Exception:
+            return False
+
+    # ---- Bulbs page
+    def _build_bulbs_page(self, page):
+        bar = ctk.CTkFrame(page, fg_color="transparent")
+        bar.pack(fill="x", padx=18, pady=(16, 0))
+        ctk.CTkLabel(bar, text="Your bulbs", font=self.f_head, text_color=MOON).pack(side="left")
+        self.find_btn = self._button(bar, "Find bulbs", self._discover, width=110)
+        self.find_btn.pack(side="right")
+        self._button(bar, "Add", self._add_ip, width=60).pack(side="right", padx=(6, 12))
+        self.ip_entry = ctk.CTkEntry(bar, width=150, height=34, corner_radius=10, fg_color=RAISED,
+                                     border_width=0, text_color=MOON, placeholder_text="Add by IP address",
+                                     placeholder_text_color=MUTED, font=self.f_body)
+        self.ip_entry.pack(side="right")
+        self.discover_label = self._label(page, "Pick the part of the screen each bulb follows during screen sync. "
+                                                "Left half and Right half split the screen between two bulbs.",
+                                          muted=True, anchor="w", justify="left", wraplength=640)
+        self.discover_label.pack(fill="x", padx=18, pady=(4, 6))
+        self.bulb_list = self._scroll(page)
+
+    def _refresh_bulb_rows(self):
+        for w in self.bulb_list.winfo_children():
+            w.destroy()
+        self.bulb_rows.clear()
+        bulbs = self.settings["bulbs"]
+        if not bulbs:
+            self._label(self.bulb_list, "No bulbs found yet. Click Find bulbs, or add one by its IP address.",
+                        muted=True).pack(pady=40)
+        for i, (ip, b) in enumerate(sorted(bulbs.items())):
+            b.setdefault("name", f"Bulb {i + 1}")
+            b.setdefault("enabled", True)
+            b.setdefault("zone", "Full screen")
+            b.setdefault("brightness_scale", 100)
+            row = ctk.CTkFrame(self.bulb_list, fg_color=NIGHT, corner_radius=12)
+            row.pack(fill="x", padx=12, pady=5)
+            row.grid_columnconfigure(3, weight=1)
+            dot = ctk.CTkFrame(row, width=18, height=18, corner_radius=9, fg_color=hex_color(OFF_BULB))
+            dot.grid(row=0, column=0, rowspan=2, padx=(16, 12), pady=14)
+            name = ctk.CTkEntry(row, width=170, height=30, fg_color="transparent", border_width=0,
+                                text_color=MOON, font=ctk.CTkFont(family=self.display_bold, size=15))
+            name.insert(0, b["name"])
+            name.bind("<KeyRelease>", lambda e, ip=ip, w=name: self.set_bulb(ip, "name", w.get()))
+            name.grid(row=0, column=1, sticky="w", pady=(10, 0))
+            self._label(row, ip, muted=True).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(0, 10))
+            zone = self._menu(row, ZONES, lambda v, ip=ip: self.set_bulb(ip, "zone", v), width=150)
+            zone.set(b["zone"])
+            zone.grid(row=0, column=2, rowspan=2, padx=10)
+            bri = ctk.CTkFrame(row, fg_color="transparent")
+            bri.grid(row=0, column=3, rowspan=2, sticky="ew", padx=6)
+            bri.grid_columnconfigure(0, weight=1)
+            scale_lbl = ctk.CTkLabel(bri, text=f"{b['brightness_scale']}%", width=44, anchor="e",
+                                     font=self.f_num, text_color=FILAMENT)
+            sl = self._slider_widget(bri, 10, 100, 18, lambda v, ip=ip, l=scale_lbl: (
+                l.configure(text=f"{int(v)}%"), self.set_bulb(ip, "brightness_scale", int(v))))
+            sl.set(b["brightness_scale"])
+            sl.grid(row=0, column=0, sticky="ew")
+            scale_lbl.grid(row=0, column=1, padx=(6, 0))
+            self._label(bri, "Brightness limit while syncing", muted=True).grid(row=1, column=0, sticky="w")
+            en = ctk.BooleanVar(value=b["enabled"])
+            ctk.CTkSwitch(row, text="", variable=en, width=46, switch_width=42, switch_height=22,
+                          fg_color=LINE, progress_color=FILAMENT, button_color=MOON,
+                          command=lambda ip=ip, v=en: (self.set_bulb(ip, "enabled", bool(v.get())),
+                                                       self._refresh_targets(), self._draw_room())
+                          ).grid(row=0, column=4, rowspan=2, padx=(10, 0))
+            acts = ctk.CTkFrame(row, fg_color="transparent")
+            acts.grid(row=0, column=5, rowspan=2, padx=(0, 10))
+            self._ghost_button(acts, "Identify", lambda ip=ip: self._identify(ip), width=70).pack()
+            self._ghost_button(acts, "Remove", lambda ip=ip: self._remove_bulb(ip), color=ROSE, width=70).pack()
+            self.bulb_rows[ip] = {"swatch": dot}
+        self._paint_dots()
+
+    def _discover(self):
+        self.find_btn.configure(state="disabled", text="Searching")
+        self.discover_label.configure(text="Searching your network for WiZ bulbs.")
+
+        def work():
+            found = discover_bulbs()
+            self.ui_queue.put(lambda: self._discover_done(found))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _discover_done(self, found):
+        self.find_btn.configure(state="normal", text="Find bulbs")
+        with self.lock:
+            known = self.settings["bulbs"]
+            new = [ip for ip in found if ip not in known]
+            for ip in sorted(new):
+                known[ip] = {"name": f"Bulb {len(known) + 1}", "enabled": True,
+                             "zone": "Full screen", "brightness_scale": 100}
+        self._schedule_save()
+        for ip, st in found.items():
+            self.display[ip] = state_to_display(st)
+        if found:
+            self.discover_label.configure(text=f"Found {len(found)} bulbs, {len(new)} of them new.")
+        else:
+            self.discover_label.configure(
+                text="No bulbs answered. Check that this PC and the bulbs are on the same Wi-Fi, "
+                     "and that local communication is on in the WiZ app.")
+        self._refresh_bulb_rows()
+        self._refresh_targets()
+        self._draw_room()
+
+    def _add_ip(self):
+        ip = self.ip_entry.get().strip()
+        try:
+            socket.inet_aton(ip)
+        except OSError:
+            self.discover_label.configure(text=f"{ip or 'That'} is not an IP address. It should look like 192.168.1.50.")
+            return
+        with self.lock:
+            self.settings["bulbs"].setdefault(ip, {"name": f"Bulb {len(self.settings['bulbs']) + 1}",
+                                                    "enabled": True, "zone": "Full screen",
+                                                    "brightness_scale": 100})
+        self._schedule_save()
+        self.ip_entry.delete(0, "end")
+        self._refresh_bulb_rows()
+        self._refresh_targets()
+        self._poll_states()
+
+    def _remove_bulb(self, ip):
+        with self.lock:
+            self.settings["bulbs"].pop(ip, None)
+        self.display.pop(ip, None)
+        self._schedule_save()
+        self._refresh_bulb_rows()
+        self._refresh_targets()
+        self._draw_room()
+
+    def _identify(self, ip):
+        """Flash the bulb soft yellow at 50% once. Works while syncing too."""
+        name = self.settings["bulbs"].get(ip, {}).get("name", ip)
+        self.discover_label.configure(text=f"{name} flashed soft yellow.")
+        engine = self.engine if self._is_syncing() else None
+        flash_for = 0.7
+        if engine:
+            engine.hold_until[ip] = time.time() + flash_for + 0.1
+
+        def work():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.5)
+            state = None if engine else bulb_get_state(sock, ip)
+            bulb_send(sock, ip, {"state": True, "r": 255, "g": 200, "b": 80, "c": 0, "w": 0, "dimming": 50})
+            time.sleep(flash_for)
+            if engine:
+                engine.hold_until.pop(ip, None)
+            else:
+                params = restore_params(state)
+                if params:
+                    bulb_send(sock, ip, params)
+            sock.close()
+
+        threading.Thread(target=work, daemon=True).start()
+
     # ---- App page
     def _build_app_page(self, page):
         sf = self._scroll(page)
         g = self._group(sf, "Startup")
         self._switch(g, "Start syncing when the app opens", "start_sync_on_launch")
-        self._switch(g, "Open at Windows login, hidden and syncing", "launch_at_login",
-                     command=self._toggle_login)
+        self._switch(g, "Open at Windows login, hidden in the tray", "launch_at_login", command=self._toggle_login)
         self._switch(g, "Put the bulbs back the way they were when syncing stops", "restore_on_stop")
-
         g = self._group(sf, "Closing the window")
         sw = self._switch(g, "Keep running in the system tray when I close the window", "close_to_tray")
         if TRAY_OK:
@@ -1113,30 +2090,26 @@ class App(ctk.CTk):
             note = "The tray needs two packages. Run  pip install pystray pillow  and restart the app."
             sw.configure(state="disabled")
         self._label(g, note, muted=True, wraplength=620, justify="left").pack(anchor="w")
-        ctk.CTkButton(g, text="Exit app", width=110, height=32, corner_radius=10, fg_color=RAISED,
-                      hover_color=LINE, text_color=ROSE, font=self.f_body,
-                      command=self._quit).pack(anchor="w", pady=(10, 0))
-
+        self._button(g, "Exit app", self._quit, color=ROSE).pack(anchor="w", pady=(10, 0))
         g = self._group(sf, "Settings")
         self._label(g, f"Saved automatically to {SETTINGS_FILE}", muted=True, wraplength=620,
                     justify="left").pack(anchor="w")
-        ctk.CTkButton(g, text="Reset all settings", width=150, height=32, corner_radius=10,
-                      fg_color=RAISED, hover_color=LINE, text_color=ROSE, font=self.f_body,
-                      command=self._reset).pack(anchor="w", pady=(10, 16))
+        self._button(g, "Reset all settings", self._reset, width=150, color=ROSE).pack(anchor="w", pady=(10, 16))
 
     def _toggle_login(self, enabled):
         try:
             set_launch_at_login(enabled)
         except OSError as exc:
-            self.discover_label.configure(text=f"Could not change the login setting: {exc}")
+            self.status_text = f"Could not change the login setting: {exc}"
 
     def _reset(self):
         with self.lock:
-            bulbs = self.settings["bulbs"]
+            bulbs, schedules = self.settings["bulbs"], self.settings["schedules"]
             self.settings = copy.deepcopy(DEFAULTS)
             self.settings["bulbs"] = {ip: {"name": b.get("name", ip), "enabled": True,
                                            "zone": "Full screen", "brightness_scale": 100}
                                       for ip, b in bulbs.items()}
+            self.settings["schedules"] = schedules
         self._sync_widgets()
         self._refresh_bulb_rows()
         self._toggle_login(False)
@@ -1183,21 +2156,31 @@ class App(ctk.CTk):
             self.discover_label.configure(text="Turn on at least one bulb first.")
             self._show_page("Bulbs")
             return
-        self.engine = SyncEngine(self.get_settings)
+        if self.fade_job and self.fade_job.is_alive():
+            self.fade_job.cancel()
+        self._clear_scene()
+        if self.settings["sync_source"] == "Music":
+            self.engine = MusicEngine(self.get_settings)
+        else:
+            self.engine = ScreenEngine(self.get_settings)
         self.engine.start()
         self.start_btn.configure(text="Stop sync", fg_color=RAISED, hover_color=LINE, text_color=ROSE)
         self._update_tray()
 
-    def _stop(self):
+    def _stop(self, restore=True):
         if self.engine:
+            if not restore:
+                self.engine.saved_states = {}
             self.engine.stop()
             self.engine.join(timeout=3)
         self.start_btn.configure(text="Start sync", fg_color=FILAMENT, hover_color=FILAMENT_HOVER,
                                  text_color=NIGHT)
-        for r in self.bulb_rows.values():
-            r["swatch"].configure(fg_color=hex_color(OFF_BULB))
+        self.status_text = ""
         self._update_tray()
-        self._draw_room(force=True)
+        if restore:
+            self.after(400, self._poll_states)
+        self._draw_room()
+        self._paint_dots()
 
     def _tick(self):
         while True:
@@ -1207,17 +2190,25 @@ class App(ctk.CTk):
                 break
         if self._quitting:
             return
+        now = time.time()
         eng = self.engine
         if eng and eng.is_alive():
-            for ip, color in list(eng.current.items()):
-                if ip in self.bulb_rows:
-                    c = hex_color(color) if color[3] else hex_color(OFF_BULB)
-                    self.bulb_rows[ip]["swatch"].configure(fg_color=c)
-            if time.time() - self._last_hero > 0.18 and self.winfo_viewable():
-                self._last_hero = time.time()
+            self._paint_dots()
+            if now - self._last_hero > 0.18 and self.winfo_viewable():
+                self._last_hero = now
                 self._draw_room()
-        elif eng and eng.error:
-            self._stop()
+        elif eng and eng.error and self.start_btn.cget("text") == "Stop sync":
+            self._stop(restore=False)
+        elif self.fade_job and self.fade_job.is_alive() and now - self._last_hero > 1.0:
+            self._last_hero = now
+            self._draw_room()
+        if now - self._last_sched_check > 2.0:
+            self._last_sched_check = now
+            self._check_schedules()
+            if self.sleep_deadline and now >= self.sleep_deadline:
+                self._sleep_now()
+            elif self.sleep_deadline and self.winfo_viewable():
+                self._draw_room()
         self.after(150, self._tick)
 
     # ------------------------------------------------------------ system tray
@@ -1228,6 +2219,9 @@ class App(ctk.CTk):
             pystray.MenuItem("Open WiZ Screen Sync", lambda: self.ui_queue.put(self._show), default=True),
             pystray.MenuItem(lambda item: "Stop sync" if self._is_syncing() else "Start sync",
                              lambda: self.ui_queue.put(self._toggle)),
+            pystray.MenuItem("Turn all bulbs off",
+                             lambda: self.ui_queue.put(lambda: self._command(
+                                 self._target_map()["All bulbs"], {"state": False}, (None, 0, "Off"), "Turned off"))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", lambda: self.ui_queue.put(self._quit)),
         )
@@ -1258,7 +2252,7 @@ class App(ctk.CTk):
             if not self._tray_notified:
                 self._tray_notified = True
                 try:
-                    self.tray.notify("Still syncing in the system tray. Right-click the icon to exit.", APP_NAME)
+                    self.tray.notify("Still running in the system tray. Right-click the icon to exit.", APP_NAME)
                 except Exception:
                     pass
             return
@@ -1268,6 +2262,8 @@ class App(ctk.CTk):
         if self._quitting:
             return
         self._quitting = True
+        if self.fade_job and self.fade_job.is_alive():
+            self.fade_job.cancel()
         self._stop()
         save_settings(self.get_settings())
         if self.tray:
@@ -1275,6 +2271,152 @@ class App(ctk.CTk):
                 self.tray.stop()
             except Exception:
                 pass
+        self.destroy()
+
+
+class ScheduleDialog(ctk.CTkToplevel):
+    """Add or edit one schedule."""
+
+    def __init__(self, app, existing=None):
+        super().__init__(app, fg_color=SURFACE)
+        self.app = app
+        self.sc = copy.deepcopy(existing) if existing else {
+            "id": f"s{int(time.time() * 1000)}", "enabled": True, "time": "07:00", "days": [0, 1, 2, 3, 4],
+            "target": "All bulbs", "action": "Wake-up fade", "value": {"minutes": 30}}
+        self.title("Edit schedule" if existing else "Add schedule")
+        self.geometry("560x520")
+        self.resizable(False, False)
+        self.transient(app)
+        self.after(50, self.grab_set)
+        f = app
+
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=24, pady=20)
+        ctk.CTkLabel(wrap, text="Edit schedule" if existing else "Add schedule", font=f.f_head,
+                     text_color=MOON).pack(anchor="w")
+
+        # time
+        h, m = (int(x) for x in self.sc["time"].split(":"))
+        row = self._row(wrap, "Time")
+        self.hour = f._menu(row, [str(i) for i in range(1, 13)], lambda v: None, width=70)
+        self.hour.set(str((h % 12) or 12))
+        self.hour.pack(side="left")
+        self.minute = f._menu(row, [f"{i:02d}" for i in range(0, 60)], lambda v: None, width=76)
+        self.minute.set(f"{m:02d}")
+        self.minute.pack(side="left", padx=6)
+        self.ampm = f._segmented(row, ["AM", "PM"], lambda v: None, "AM" if h < 12 else "PM")
+        self.ampm.pack(side="left", padx=6)
+
+        # days
+        row = self._row(wrap, "Days")
+        self.day_vars = []
+        for i, d in enumerate(DAY_NAMES):
+            var = ctk.BooleanVar(value=i in self.sc["days"])
+            ctk.CTkCheckBox(row, text=d, variable=var, width=58, font=f.f_small, text_color=MOON,
+                            fg_color=FILAMENT, hover_color=FILAMENT_HOVER, border_color=LINE,
+                            checkmark_color=NIGHT, checkbox_width=18, checkbox_height=18).pack(side="left")
+            self.day_vars.append(var)
+
+        row = self._row(wrap, "Bulbs")
+        self.target = f._menu(row, list(app._target_map()), lambda v: None, width=200)
+        self.target.set(self.sc.get("target", "All bulbs"))
+        self.target.pack(side="left")
+
+        row = self._row(wrap, "Action")
+        self.action = f._menu(row, ACTIONS, lambda v: self._build_value(), width=200)
+        self.action.set(self.sc["action"])
+        self.action.pack(side="left")
+
+        self.value_box = ctk.CTkFrame(wrap, fg_color="transparent")
+        self.value_box.pack(fill="x", pady=(8, 0))
+        self.values = {}
+        self._build_value()
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.pack(fill="x", padx=24, pady=(0, 20), side="bottom")
+        f._button(btns, "Save", self._save, width=110, primary=True).pack(side="right")
+        f._button(btns, "Cancel", self.destroy, width=90).pack(side="right", padx=8)
+
+    def _row(self, parent, label):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=(12, 0))
+        self.app._label(row, label, width=70, anchor="w").pack(side="left")
+        return row
+
+    def _value_slider(self, label, key, lo, hi, steps, default, fmt):
+        row = ctk.CTkFrame(self.value_box, fg_color="transparent")
+        row.pack(fill="x", pady=(8, 0))
+        row.grid_columnconfigure(1, weight=1)
+        self.app._label(row, label, width=110, anchor="w").grid(row=0, column=0, sticky="w")
+        v0 = self.sc.get("value", {}).get(key, default)
+        lbl = ctk.CTkLabel(row, text=fmt.format(v0), width=70, anchor="e", font=self.app.f_num,
+                           text_color=FILAMENT)
+        lbl.grid(row=0, column=2)
+        var = {"v": v0}
+
+        def ch(v):
+            var["v"] = int(round(v))
+            lbl.configure(text=fmt.format(var["v"]))
+
+        sl = self.app._slider_widget(row, lo, hi, steps, ch)
+        sl.set(v0)
+        sl.grid(row=0, column=1, sticky="ew", padx=10)
+        self.values[key] = var
+
+    def _build_value(self):
+        for w in self.value_box.winfo_children():
+            w.destroy()
+        self.values = {}
+        a = self.action.get()
+        if a in ("Turn on", "Set white", "Set color", "Play scene"):
+            self._value_slider("Brightness", "brightness", 10, 100, 90, 80, "{}%")
+        if a == "Set white":
+            self._value_slider("White", "kelvin", MIN_KELVIN, MAX_KELVIN, 43, 3000, "{}K")
+        if a == "Set color":
+            row = ctk.CTkFrame(self.value_box, fg_color="transparent")
+            row.pack(fill="x", pady=(10, 0))
+            self.app._label(row, "Color", width=110, anchor="w").pack(side="left")
+            cur = tuple(self.sc.get("value", {}).get("color", QUICK_COLORS[1]))
+            self.values["color"] = {"v": list(cur)}
+            self._color_btns = []
+            for rgb in QUICK_COLORS:
+                b = ctk.CTkButton(row, text="", width=30, height=30, corner_radius=15, fg_color=hex_color(rgb),
+                                  hover_color=hex_color(rgb), border_color=MOON,
+                                  border_width=3 if tuple(rgb) == cur else 0,
+                                  command=lambda c=rgb: self._pick_color(c))
+                b.pack(side="left", padx=2)
+                self._color_btns.append((rgb, b))
+        if a == "Play scene":
+            row = ctk.CTkFrame(self.value_box, fg_color="transparent")
+            row.pack(fill="x", pady=(10, 0))
+            self.app._label(row, "Scene", width=110, anchor="w").pack(side="left")
+            names = [SCENES[i] for i in sorted(SCENES)]
+            menu = self.app._menu(row, names, lambda v: None, width=200)
+            menu.set(SCENES.get(self.sc.get("value", {}).get("scene", 1), "Ocean"))
+            menu.pack(side="left", padx=10)
+            self.values["scene"] = {"menu": menu}
+            self._value_slider("Speed", "speed", 10, 200, 19, 100, "{}%")
+        if a in ("Wake-up fade", "Bedtime fade"):
+            self._value_slider("Fade length", "minutes", 5, 60, 11, 30, "{} min")
+            note = ("Starts at this time with dim warm light and brightens to daylight."
+                    if a == "Wake-up fade" else "Starts at this time, dims slowly and turns the bulbs off.")
+            self.app._label(self.value_box, note, muted=True, wraplength=480, justify="left").pack(anchor="w",
+                                                                                                pady=(8, 0))
+
+    def _pick_color(self, rgb):
+        self.values["color"]["v"] = list(rgb)
+        for c, b in self._color_btns:
+            b.configure(border_width=3 if c == rgb else 0)
+
+    def _save(self):
+        h = int(self.hour.get()) % 12 + (12 if self.ampm.get() == "PM" else 0)
+        days = [i for i, v in enumerate(self.day_vars) if v.get()]
+        value = {}
+        for k, v in self.values.items():
+            value[k] = SCENE_IDS[v["menu"].get()] if "menu" in v else v["v"]
+        self.sc.update({"time": f"{h:02d}:{int(self.minute.get()):02d}", "days": days,
+                        "target": self.target.get(), "action": self.action.get(), "value": value})
+        self.app._save_schedule(self.sc)
         self.destroy()
 
 
