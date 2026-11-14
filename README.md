@@ -1,6 +1,6 @@
-# WiZ Screen Sync
+# WiZard
 
-A Windows desktop app that makes WiZ smart bulbs follow the colors on your screen. It talks to the bulbs directly over the local Wi-Fi network.
+A Windows desktop app for WiZ smart bulbs: screen sync, music sync, manual control, scenes, rooms, schedules and a sleep timer. It talks to the bulbs directly over the local Wi-Fi network.
 
 Unofficial project. Not affiliated with, endorsed by or sponsored by Signify, WiZ or Philips.
 
@@ -18,9 +18,9 @@ python -m pip install -r requirements.txt
 python wiz_sync_app.py
 ```
 
-Click Find bulbs, pick a screen area for each bulb, and click Start sync. Closing the window keeps the app in the tray.
+Click Find lights on the Lights page. Click a light or a room to control it. Choose Screen or Music next to Start sync to sync the lights.
 
-The first version, `wiz_screen_sync.py`, still works as a command-line tool.
+Settings are saved to `%APPDATA%\WiZard\settings.json`.
 
 ## License
 
