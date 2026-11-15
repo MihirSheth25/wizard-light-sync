@@ -25,12 +25,12 @@ import numpy as np
 
 try:
     import customtkinter as ctk
+    from PIL import Image as PILImage, ImageDraw as PILDraw, ImageFilter, ImageTk, ImageChops
 except ImportError:  # pragma: no cover
-    sys.exit("Missing package. Run:  pip install customtkinter mss numpy")
+    sys.exit("Missing packages. Run:  pip install customtkinter pillow mss numpy")
 
 try:  # system tray support is optional
     import pystray
-    from PIL import Image, ImageDraw
     TRAY_OK = True
 except Exception:  # missing package, or no tray backend on this system
     TRAY_OK = False
@@ -69,6 +69,7 @@ DEFAULTS = {
     "launch_at_login": False,
     "restore_on_stop": True,
     "close_to_tray": True,
+    "sidebar_open": True,
     "sync_source": "Screen",          # what Start sync follows: Screen or Music
     "music_mode": "Beat pulse",
     "music_palette": "Rainbow",
@@ -78,7 +79,6 @@ DEFAULTS = {
     "music_fps": 12,
     "music_smoothing": 0.3,
     "music_split_colors": True,
-    "control_target": "All bulbs",
     "control_brightness": 80,
     "control_kelvin": 3000,
     "control_color": [255, 140, 60],
@@ -357,6 +357,29 @@ def state_to_display(state):
     return (255, 200, 140), dim, "On"
 
 
+def color_cmd(rgb, dim):
+    r, g, b = (int(x) for x in rgb[:3])
+    return {"state": True, "r": r, "g": g, "b": b, "c": 0, "w": 0, "dimming": dim}, ((r, g, b), dim, "Color")
+
+
+def white_cmd(kelvin, dim):
+    return {"state": True, "temp": kelvin, "dimming": dim}, (kelvin_to_rgb(kelvin), dim, f"White {kelvin}K")
+
+
+def scene_cmd(sid, dim, speed):
+    params = {"state": True, "sceneId": sid, "dimming": dim}
+    if sid not in STATIC_SCENES:
+        params["speed"] = speed
+    return params, (SCENE_LOOK[sid][0], dim, SCENES[sid])
+
+
+def on_cmd(dim):
+    return {"state": True, "dimming": dim}, ((255, 200, 140), dim, "On")
+
+
+OFF_CMD = ({"state": False}, (None, 0, "Off"))
+
+
 # ======================================================================= engines
 
 class BulbEngine(threading.Thread):
@@ -399,8 +422,7 @@ class BulbEngine(threading.Thread):
         if old is not None and len(old) == 4 and isinstance(old[0], int):
             if max(abs(x - y) for x, y in zip(key, old)) < max(1, threshold):
                 return False
-        bulb_send(self._sock, ip, {"state": True, "r": key[0], "g": key[1], "b": key[2],
-                                   "c": 0, "w": 0, "dimming": key[3]})
+        bulb_send(self._sock, ip, color_cmd(key[:3], key[3])[0])
         last_sent[ip] = key
         self.current[ip] = key
         return True
@@ -746,7 +768,6 @@ class FadeJob(threading.Thread):
                 self.on_done()
 
 
-SyncEngine = ScreenEngine
 
 
 # ======================================================================= launch at login (Windows)
@@ -789,12 +810,6 @@ def set_launch_at_login(enabled):
 
 import tkinter as tk
 from tkinter import font as tkfont
-
-try:
-    from PIL import Image as PILImage, ImageDraw as PILDraw, ImageFilter, ImageTk, ImageChops
-    PIL_OK = True
-except Exception:
-    PIL_OK = False
 
 # Night-bedroom palette
 NIGHT = "#16121F"       # the wall at night: window background
@@ -993,9 +1008,8 @@ class ColorWheel(tk.Canvas):
     def __init__(self, master, size=220, command=None, bg=SURFACE):
         super().__init__(master, width=size, height=size, bg=bg, highlightthickness=0, bd=0)
         self.size, self.command = size, command
-        self._img = ImageTk.PhotoImage(wheel_image(size)) if PIL_OK else None
-        if self._img:
-            self.create_image(0, 0, image=self._img, anchor="nw")
+        self._img = ImageTk.PhotoImage(wheel_image(size))
+        self.create_image(0, 0, image=self._img, anchor="nw")
         self.marker = self.create_oval(0, 0, 0, 0, outline="#ffffff", width=3)
         self.bind("<Button-1>", self._pick)
         self.bind("<B1-Motion>", self._pick)
@@ -1021,15 +1035,6 @@ class ColorWheel(tk.Canvas):
         self._place(h, s)
 
 
-def kelvin_strip(width, height):
-    img = PILImage.new("RGB", (width, height))
-    d = PILDraw.Draw(img)
-    for x in range(width):
-        k = MIN_KELVIN + (MAX_KELVIN - MIN_KELVIN) * x / max(1, width - 1)
-        d.line((x, 0, x, height), fill=kelvin_to_rgb(k))
-    return img
-
-
 def scene_chip(sid, size=26):
     a, b = SCENE_LOOK.get(sid, ((255, 200, 140), (255, 200, 140)))
     s4 = size * 4
@@ -1040,16 +1045,42 @@ def scene_chip(sid, size=26):
     return img.resize((size, size), PILImage.LANCZOS)
 
 
+def glyph(kind, size=22, color=MOON):
+    """Hamburger menu or back chevron, drawn at 4x and scaled down for smooth edges."""
+    s = size * 4
+    img = PILImage.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = PILDraw.Draw(img)
+    col = _rgb(color)
+    w = int(s * 0.09)
+    if kind == "menu":
+        for y in (0.28, 0.5, 0.72):
+            d.rounded_rectangle((s * 0.18, s * y - w / 2, s * 0.82, s * y + w / 2), radius=w // 2, fill=col)
+    else:  # back
+        d.line([(s * 0.62, s * 0.2), (s * 0.34, s * 0.5), (s * 0.62, s * 0.8)], fill=col, width=w, joint="curve")
+    img = img.resize((size, size), PILImage.LANCZOS)
+    return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+
+
+def icon_path():
+    """wiz.ico inside the built .exe or next to the .py, on Windows only."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(base, "wiz.ico")
+    return path if sys.platform == "win32" and os.path.exists(path) else None
+
+
 class SwapArea(ctk.CTkFrame):
     """
     Holds stacked layers. New content is built in a layer underneath the visible one,
     drawn while hidden, and then raised in one step, so the old and new screens never mix.
     """
 
+    SETTLE_MS = 90   # time for the hidden layer's widgets to finish drawing before it is shown
+
     def __init__(self, master, bg):
         super().__init__(master, fg_color=bg, corner_radius=0)
         self.bg = bg
         self.current = None
+        self.pending = None
 
     def new_layer(self):
         layer = ctk.CTkFrame(self, fg_color=self.bg, corner_radius=0)
@@ -1058,12 +1089,23 @@ class SwapArea(ctk.CTkFrame):
             layer.lower(self.current)
         return layer
 
-    def commit(self, layer):
-        old, self.current = self.current, layer
-        self.update_idletasks()          # let the hidden layer finish drawing
-        layer.lift()
-        if old is not None:
-            self.after(60, old.destroy)
+    def commit(self, layer, then=None):
+        """Show the layer once it has drawn, then run `then` (for example, raise its page)."""
+        self.pending = layer
+        self.update_idletasks()
+
+        def finish():
+            if self.pending is not layer:        # a newer layer replaced this one meanwhile
+                layer.destroy()
+                return
+            old, self.current, self.pending = self.current, layer, None
+            layer.lift()
+            if old is not None:
+                self.after(40, old.destroy)
+            if then:
+                then()
+
+        self.after(self.SETTLE_MS, finish)
 
 
 class App(ctk.CTk):
@@ -1092,7 +1134,6 @@ class App(ctk.CTk):
         self._current_scene = None
         self.display = {}            # ip -> (rgb or None, dim, words) when nothing is syncing
         self.status_text = ""
-        self.bulb_rows = {}
         self.slider_widgets = {}
         self._save_job = None
         self.ui_queue = queue.Queue()
@@ -1125,9 +1166,8 @@ class App(ctk.CTk):
             self.after(100, self.withdraw if self.tray else self.iconify)
 
     def _dialog_icon(self, win):
-        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-        path = os.path.join(base, "wiz.ico")
-        if os.path.exists(path) and sys.platform == "win32":
+        path = icon_path()
+        if path:
             win.after(260, lambda: win.iconbitmap(path))   # after customtkinter sets its own
 
     def _center_dialog(self, win):
@@ -1139,9 +1179,8 @@ class App(ctk.CTk):
         win.geometry(f"+{max(0, x)}+{max(0, y)}")
 
     def _set_window_icon(self):
-        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-        path = os.path.join(base, "wiz.ico")
-        if os.path.exists(path) and sys.platform == "win32":
+        path = icon_path()
+        if path:
             try:
                 self.iconbitmap(path)
                 self.after(250, lambda: self.iconbitmap(path))
@@ -1241,8 +1280,12 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ header
     def _build_header(self):
+        self._icons = {"menu": glyph("menu"), "back": glyph("back")}
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=28, pady=(20, 0))
+        top.pack(fill="x", padx=(18, 28), pady=(20, 0))
+        ctk.CTkButton(top, text="", image=self._icons["menu"], width=40, height=40, corner_radius=20,
+                      fg_color="transparent", hover_color=SURFACE,
+                      command=self._toggle_sidebar).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(top, text=APP_NAME, font=self.f_title, text_color=MOON).pack(side="left")
 
         self.start_btn = ctk.CTkButton(top, text="Start sync", width=150, height=42, corner_radius=21,
@@ -1304,14 +1347,9 @@ class App(ctk.CTk):
         bulbs = self._room_bulbs(w, h, scale)
         c.delete("all")
         thumb = self.engine.preview if self._is_syncing() else None
-        if PIL_OK:
-            img, (mx0, my0, mw, mh) = render_room(w, h, bulbs, thumb, scale)
-            self._hero_img = ImageTk.PhotoImage(img)
-            c.create_image(0, 0, image=self._hero_img, anchor="nw")
-        else:
-            mw, mh = int(250 * scale), int(141 * scale)
-            mx0, my0 = (w - mw) // 2, int(h * 0.40 - mh / 2)
-            c.create_rectangle(mx0, my0, mx0 + mw, my0 + mh, fill=SURFACE, outline=LINE)
+        img, (mx0, my0, mw, mh) = render_room(w, h, bulbs, thumb, scale)
+        self._hero_img = ImageTk.PhotoImage(img)
+        c.create_image(0, 0, image=self._hero_img, anchor="nw")
 
         name_font = (self.display_bold, 13)
         info_font = (self.f_small.cget("family"), 10)
@@ -1354,8 +1392,9 @@ class App(ctk.CTk):
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=20, pady=(6, 20))
 
-        nav = ctk.CTkFrame(body, fg_color="transparent", width=180)
-        nav.pack(side="left", fill="y", padx=(0, 14))
+        nav = self.nav = ctk.CTkFrame(body, fg_color="transparent", width=180)
+        if self.settings.get("sidebar_open", True):
+            nav.pack(side="left", fill="y", padx=(0, 14))
         self.nav_buttons = {}
         for gi, group in enumerate(self.NAV):
             if gi:
@@ -1391,10 +1430,22 @@ class App(ctk.CTk):
         self.detail_area.pack(fill="both", expand=True)
         self._dirty = {"Lights": True, "Rooms": True}
 
+    def _toggle_sidebar(self):
+        if self.nav.winfo_manager():
+            self.nav.pack_forget()
+            self.set("sidebar_open", False)
+        else:
+            self.nav.pack(side="left", fill="y", padx=(0, 14), before=self.page_host)
+            self.set("sidebar_open", True)
+
     def _show_page(self, name, nav=None):
-        if self._dirty.get(name):            # rebuild underneath first, then show
-            (self._refresh_light_rows if name == "Lights" else self._refresh_room_rows)()
-        self.update_idletasks()
+        if self._dirty.get(name):            # rebuild hidden first; raise the page once it is drawn
+            refresh = self._refresh_light_rows if name == "Lights" else self._refresh_room_rows
+            refresh(then=lambda: self._raise_page(name, nav))
+        else:
+            self._raise_page(name, nav)
+
+    def _raise_page(self, name, nav=None):
         self.pages[name].lift()
         self.current_page = name
         lit = nav or name
@@ -1531,10 +1582,11 @@ class App(ctk.CTk):
         if self._is_syncing():
             self._stop(restore=False)
 
-    def _command(self, ips, params, look, status, throttle=False):
-        """Send params to the lights and remember how they look for the room picture."""
+    def _command(self, ips, cmd, status, throttle=False, keep_scene=False):
+        """Send a command (params, look) to the lights and remember how they look for the room picture."""
+        params, look = cmd
         self._take_over()
-        if not status.endswith("scene"):
+        if not keep_scene:
             self._clear_scene()
         for ip in ips:
             self.display[ip] = look
@@ -1676,10 +1728,11 @@ class App(ctk.CTk):
 
         head = ctk.CTkFrame(page, fg_color="transparent")
         head.pack(fill="x", padx=18, pady=(14, 0))
-        self._ghost_button(head, f"Back to {back_to.lower()}", lambda: self._show_page(back_to), color=MUTED,
-                           width=120).pack(anchor="w")
         title_row = ctk.CTkFrame(head, fg_color="transparent")
         title_row.pack(fill="x", pady=(4, 0))
+        ctk.CTkButton(title_row, text="", image=self._icons["back"], width=36, height=36, corner_radius=18,
+                      fg_color="transparent", hover_color=RAISED,
+                      command=lambda: self._show_page(back_to)).pack(side="left", padx=(0, 4))
         dots = ctk.CTkFrame(title_row, fg_color="transparent")
         dots.pack(side="left", padx=(4, 12))
         for ip in self._ips_for_key(key)[:6]:
@@ -1706,7 +1759,7 @@ class App(ctk.CTk):
         if key != "all":
             self._ghost_button(title_row, "Rename", lambda: self._start_rename(self.header_cell), color=MOON,
                                width=80).pack(side="right", padx=(0, 6))
-        self._label(head, sub, muted=True).pack(anchor="w", padx=(4, 0))
+        self._label(head, sub, muted=True).pack(anchor="w", padx=(44, 0))
 
         if is_room:
             tabs = ["Lights", "Control", "Scenes", "Schedules"]
@@ -1732,8 +1785,7 @@ class App(ctk.CTk):
         elif "Settings" in tabs:
             self._build_light_settings(self.detail_frames["Settings"], key[6:])
         self._detail_switch(self.detail_tab)
-        self.detail_area.commit(page)
-        self._show_page("Detail", nav=back_to)
+        self.detail_area.commit(page, then=lambda: self._raise_page("Detail", nav=back_to))
         self._paint_dots()
 
     def _detail_switch(self, tab):
@@ -1761,12 +1813,10 @@ class App(ctk.CTk):
         body.pack(fill="both", expand=True, padx=18, pady=(14, 12))
         left = ctk.CTkFrame(body, fg_color="transparent")
         left.pack(side="left", padx=(0, 28), anchor="n")
-        self.wheel = None
-        if PIL_OK:
-            self.wheel = ColorWheel(left, size=210, command=self._pick_color)
-            self.wheel.pack()
-            self.wheel.set_color(tuple(look[0]) if look[0] and look[2] == "Color"
-                                 else tuple(self.settings["control_color"]))
+        self.wheel = ColorWheel(left, size=210, command=self._pick_color)
+        self.wheel.pack()
+        self.wheel.set_color(tuple(look[0]) if look[0] and look[2] == "Color"
+                             else tuple(self.settings["control_color"]))
         right = ctk.CTkFrame(body, fg_color="transparent")
         right.pack(side="left", fill="both", expand=True, anchor="n")
 
@@ -1776,7 +1826,7 @@ class App(ctk.CTk):
         for rgb in QUICK_COLORS:
             ctk.CTkButton(sw_row, text="", width=34, height=34, corner_radius=17, fg_color=hex_color(rgb),
                           hover_color=hex_color(rgb), border_width=0,
-                          command=lambda c=rgb: (self.wheel.set_color(c) if self.wheel else None,
+                          command=lambda c=rgb: (self.wheel.set_color(c),
                                                  self._pick_color(c, throttle=False))).pack(side="left", padx=3)
 
         self._label(right, "Whites", font=self.f_head).pack(anchor="w")
@@ -1823,20 +1873,16 @@ class App(ctk.CTk):
     def _pick_color(self, rgb, throttle=True):
         self.set("control_color", list(rgb))
         self._last_mode = "color"
-        dim = self.settings["control_brightness"]
-        self._command(self._detail_ips(), {"state": True, "r": rgb[0], "g": rgb[1], "b": rgb[2],
-                                           "c": 0, "w": 0, "dimming": dim},
-                      (rgb, dim, "Color"), f"{self._key_name(self.detail_key)}: color", throttle)
+        self._command(self._detail_ips(), color_cmd(rgb, self.settings["control_brightness"]),
+                      f"{self._key_name(self.detail_key)}: color", throttle)
 
     def _pick_white(self, k, throttle=True):
         k = int(round(k / 100) * 100)
         self.k_label.configure(text=f"{k}K")
         self.set("control_kelvin", k)
         self._last_mode = "white"
-        dim = self.settings["control_brightness"]
-        self._command(self._detail_ips(), {"state": True, "temp": k, "dimming": dim},
-                      (kelvin_to_rgb(k), dim, f"White {k}K"), f"{self._key_name(self.detail_key)}: white",
-                      throttle)
+        self._command(self._detail_ips(), white_cmd(k, self.settings["control_brightness"]),
+                      f"{self._key_name(self.detail_key)}: white", throttle)
 
     def _pick_brightness(self, v):
         v = int(v)
@@ -1844,25 +1890,21 @@ class App(ctk.CTk):
         self.set("control_brightness", v)
         ips = self._detail_ips()
         look = self.display.get(ips[0], (None, v, "")) if ips else (None, v, "")
-        self._command(ips, {"state": True, "dimming": v}, (look[0] or (255, 200, 140), v, look[2] or "On"),
-                      f"{self._key_name(self.detail_key)}: brightness", throttle=True)
+        self._command(ips, ({"state": True, "dimming": v}, (look[0] or (255, 200, 140), v, look[2] or "On")),
+                      f"{self._key_name(self.detail_key)}: brightness", throttle=True, keep_scene=True)
 
     def _power(self, on, key=None):
         key = key or self.detail_key
-        ips = self._ips_for_key(key)
-        name = self._key_name(key)
+        ips, name = self._ips_for_key(key), self._key_name(key)
         if not on:
-            self._command(ips, {"state": False}, (None, 0, "Off"), f"{name}: off")
+            self._command(ips, OFF_CMD, f"{name}: off")
             return
         dim = self.settings["control_brightness"]
         if getattr(self, "_last_mode", "color") == "white":
-            k = self.settings["control_kelvin"]
-            self._command(ips, {"state": True, "temp": k, "dimming": dim},
-                          (kelvin_to_rgb(k), dim, f"White {k}K"), f"{name}: on")
+            cmd = white_cmd(self.settings["control_kelvin"], dim)
         else:
-            rgb = tuple(self.settings["control_color"])
-            self._command(ips, {"state": True, "r": rgb[0], "g": rgb[1], "b": rgb[2], "c": 0, "w": 0,
-                                "dimming": dim}, (rgb, dim, "Color"), f"{name}: on")
+            cmd = color_cmd(self.settings["control_color"], dim)
+        self._command(ips, cmd, f"{name}: on")
 
     # ---- Scenes tab
     def _build_scenes(self, page, key):
@@ -1882,12 +1924,10 @@ class App(ctk.CTk):
             grid = ctk.CTkFrame(g, fg_color="transparent")
             grid.pack(fill="x", pady=(6, 0))
             for i, sid in enumerate(ids):
-                img = None
-                if PIL_OK:
-                    if sid not in self._scene_imgs:
-                        pil = scene_chip(sid)
-                        self._scene_imgs[sid] = ctk.CTkImage(light_image=pil, dark_image=pil, size=(22, 22))
-                    img = self._scene_imgs[sid]
+                if sid not in self._scene_imgs:
+                    pil = scene_chip(sid)
+                    self._scene_imgs[sid] = ctk.CTkImage(light_image=pil, dark_image=pil, size=(22, 22))
+                img = self._scene_imgs[sid]
                 btn = ctk.CTkButton(grid, text=SCENES[sid], image=img, compound="left", anchor="w", width=150,
                                     height=40, corner_radius=10, fg_color=NIGHT, hover_color=RAISED,
                                     text_color=MOON, font=self.f_body, border_width=2, border_color=NIGHT,
@@ -1902,17 +1942,16 @@ class App(ctk.CTk):
 
     def _play_scene(self, sid):
         key = self.detail_key
-        ips = self._ips_for_key(key)
-        dim, speed = self.settings["scene_brightness"], self.settings["scene_speed"]
-        params = {"state": True, "sceneId": sid, "dimming": dim}
-        if sid not in STATIC_SCENES:
-            params["speed"] = speed
-        self._command(ips, params, (SCENE_LOOK[sid][0], dim, SCENES[sid]),
-                      f"{self._key_name(key)}: {SCENES[sid]} scene")
-        self._current_scene = (sid, key)
+        self._send_scene(sid, key)
         self.scene_now.configure(text=f"Playing {SCENES[sid]}")
         for other, btn in self._scene_btns.items():
             btn.configure(border_color=FILAMENT if other == sid else NIGHT)
+
+    def _send_scene(self, sid, key, throttle=False):
+        cmd = scene_cmd(sid, self.settings["scene_brightness"], self.settings["scene_speed"])
+        self._command(self._ips_for_key(key), cmd, f"{self._key_name(key)}: {SCENES[sid]} scene", throttle,
+                      keep_scene=True)
+        self._current_scene = (sid, key)
 
     def _clear_scene(self):
         self._current_scene = None
@@ -1928,14 +1967,7 @@ class App(ctk.CTk):
 
     def _resend_scene(self):
         if self._current_scene and not self._is_syncing():
-            sid, key = self._current_scene
-            dim, speed = self.settings["scene_brightness"], self.settings["scene_speed"]
-            params = {"state": True, "sceneId": sid, "dimming": dim}
-            if sid not in STATIC_SCENES:
-                params["speed"] = speed
-            self._command(self._ips_for_key(key), params, (SCENE_LOOK[sid][0], dim, SCENES[sid]),
-                          f"{self._key_name(key)}: {SCENES[sid]} scene", throttle=True)
-            self._current_scene = (sid, key)
+            self._send_scene(*self._current_scene, throttle=True)
 
     # ---- Schedules tab
     def _build_schedules(self, page, key):
@@ -2027,26 +2059,14 @@ class App(ctk.CTk):
         key = self._norm_key(sc.get("target"))
         ips, name = self._ips_for_key(key), self._key_name(key)
         dim = v.get("brightness", 80)
-        if a == "Turn on":
-            self._command(ips, {"state": True, "dimming": dim}, ((255, 200, 140), dim, "On"), f"Schedule: {name} on")
-        elif a == "Turn off":
-            self._command(ips, {"state": False}, (None, 0, "Off"), f"Schedule: {name} off")
-        elif a == "Set white":
-            k = v.get("kelvin", 3000)
-            self._command(ips, {"state": True, "temp": k, "dimming": dim}, (kelvin_to_rgb(k), dim, f"White {k}K"),
-                          f"Schedule: {name} white")
-        elif a == "Set color":
-            rgb = tuple(v.get("color", (255, 140, 60)))
-            self._command(ips, {"state": True, "r": rgb[0], "g": rgb[1], "b": rgb[2], "c": 0, "w": 0,
-                                "dimming": dim}, (rgb, dim, "Color"), f"Schedule: {name} color")
-        elif a == "Play scene":
-            sid = v.get("scene", 1)
-            params = {"state": True, "sceneId": sid, "dimming": dim}
-            if sid not in STATIC_SCENES:
-                params["speed"] = v.get("speed", 100)
-            self._command(ips, params, (SCENE_LOOK[sid][0], dim, SCENES[sid]),
-                          f"Schedule: {name}: {SCENES[sid]} scene")
-        elif a == "Wake-up fade":
+        cmd = {"Turn on": lambda: on_cmd(dim),
+               "Turn off": lambda: OFF_CMD,
+               "Set white": lambda: white_cmd(v.get("kelvin", 3000), dim),
+               "Set color": lambda: color_cmd(v.get("color", (255, 140, 60)), dim),
+               "Play scene": lambda: scene_cmd(v.get("scene", 1), dim, v.get("speed", 100))}.get(a)
+        if cmd:
+            self._command(ips, cmd(), f"Schedule: {name}: {action_text(sc).lower()}")
+        if a == "Wake-up fade":
             self._start_fade(ips, v.get("minutes", 30), 10, 100, 2200, 5000, False, f"{name}: wake-up fade")
         elif a == "Bedtime fade":
             self._start_fade(ips, v.get("minutes", 30), 60, 10, 2700, 2200, True, f"{name}: bedtime fade")
@@ -2267,7 +2287,7 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
-    def _refresh_light_rows(self):
+    def _refresh_light_rows(self, then=None):
         area = getattr(self, "light_area", None)
         if not area:
             return
@@ -2324,7 +2344,7 @@ class App(ctk.CTk):
             self._ghost_button(acts, "Rename", lambda c=name: self._start_rename(c), width=70).pack()
             self._button(row, "Open", lambda k=key: self._open_detail(k), width=64).grid(
                 row=0, column=6, rowspan=2, padx=(0, 12))
-        area.commit(layer)
+        area.commit(layer, then)
         self._paint_dots()
 
     def _discover(self):
@@ -2395,7 +2415,7 @@ class App(ctk.CTk):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(0.5)
             state = None if engine else bulb_get_state(sock, ip)
-            bulb_send(sock, ip, {"state": True, "r": 255, "g": 200, "b": 80, "c": 0, "w": 0, "dimming": 50})
+            bulb_send(sock, ip, color_cmd((255, 200, 80), 50)[0])   # soft yellow, half brightness
             time.sleep(flash_for)
             if engine:
                 engine.hold_until.pop(ip, None)
@@ -2491,7 +2511,7 @@ class App(ctk.CTk):
             return "All on"
         return f"{len(on)} of {len(ips)} on"
 
-    def _refresh_room_rows(self):
+    def _refresh_room_rows(self, then=None):
         area = getattr(self, "room_area", None)
         if not area:
             return
@@ -2527,7 +2547,7 @@ class App(ctk.CTk):
             parts = [row, dots, name, sub, count, state, *dots.winfo_children()]
             self._clickable(parts, key)
             self._hover(row, parts[1:])
-        area.commit(layer)
+        area.commit(layer, then)
         self._paint_dots()
 
     # ---- Lights tab for a room: its lights, adding and removing, deleting the room
@@ -3023,8 +3043,8 @@ class ScheduleDialog(ctk.CTkToplevel):
 def tray_image(syncing):
     """A small bulb icon: colorful while syncing, gray when stopped."""
     size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
+    img = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = PILDraw.Draw(img)
     if syncing:
         for i, col in enumerate([(255, 60, 60), (255, 170, 0), (60, 200, 90), (60, 120, 255)]):
             d.pieslice((6, 2, 58, 54), 90 * i - 135, 90 * i - 45, fill=col)
