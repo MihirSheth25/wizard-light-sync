@@ -131,6 +131,8 @@ def load_settings():
                 data[k] = v
     except (OSError, ValueError):
         pass
+    for i, sc in enumerate(data["schedules"]):    # every schedule needs an id to edit or delete it
+        sc.setdefault("id", f"s{i}")
     return data
 
 
@@ -395,7 +397,6 @@ class BulbEngine(threading.Thread):
         self.get_settings = get_settings
         self.stop_event = threading.Event()
         self.current = {}        # ip -> (r, g, b, dimming) last sent
-        self.preview = None      # screen thumbnail (screen) or spectrum bars (music)
         self.hold_until = {}     # ip -> time; leave that bulb alone until then (Identify)
         self.error = None
         self.actual_fps = 0.0
@@ -474,8 +475,6 @@ class ScreenEngine(BulbEngine):
                 step = max(1, int(s["sample_step"]))
                 shot = np.asarray(sct.grab(sct.monitors[mon_idx]))
                 frame = shot[::step, ::step, 2::-1]
-                k = max(1, shot.shape[1] // 240)
-                self.preview = shot[::k, ::k, 2::-1]
                 frame = crop_margins(frame, s)
                 if s["ignore_black_bars"]:
                     frame = strip_black_bars(frame)
@@ -670,7 +669,6 @@ class MusicEngine(BulbEngine):
                 for ip in bulbs:
                     self.remember(ip)
                 info = analyzer.analyze(audio.read(), s["music_sensitivity"])
-                self.preview = info["bars"]
                 mode, palette = s["music_mode"], s["music_palette"]
 
                 if mode == "Beat pulse":
@@ -845,7 +843,7 @@ def bulb_side(zone, index):
 
 
 def zone_box(zone, x0, y0, x1, y1):
-    """Rectangle of the screen area a bulb follows, inside the thumbnail box."""
+    """Rectangle of the screen area a bulb follows, inside the monitor picture."""
     w, h = x1 - x0, y1 - y0
     fr = {
         "Left half": (0, 0, .5, 1), "Right half": (.5, 0, 1, 1), "Top half": (0, 0, 1, .5),
@@ -855,11 +853,129 @@ def zone_box(zone, x0, y0, x1, y1):
     return (x0 + fr[0] * w, y0 + fr[1] * h, x0 + fr[2] * w, y0 + fr[3] * h)
 
 
-def render_room(w, h, bulbs, thumb, scale=1.0):
+SCENE_IDS = {name: sid for sid, name in SCENES.items()}
+EQ_LEVELS = [0.35, 0.6, 0.85, 0.55, 0.72, 0.95, 0.62, 0.42, 0.78, 0.5, 0.3, 0.66, 0.45, 0.25]
+
+
+def hue_name(rgb):
+    """A plain color name for an RGB value, for labels."""
+    h, s, v = colorsys.rgb_to_hsv(*(c / 255 for c in rgb))
+    if s < 0.18:
+        return "White"
+    deg = h * 360
+    for limit, name in ((15, "Red"), (40, "Orange"), (65, "Yellow"), (160, "Green"), (195, "Cyan"),
+                        (250, "Blue"), (290, "Purple"), (335, "Pink"), (361, "Red")):
+        if deg < limit:
+            return name
+    return "Color"
+
+
+def room_layout(w, h, scale, side=None):
+    """Where the monitor (and a laptop on one side, if Windows shows a second display) sit."""
+    mw, mh = int(250 * scale), int(141 * scale)
+    my0 = int(h * 0.40 - mh / 2)
+    desk = my0 + mh + int(28 * scale)
+    laptop = None
+    if side in ("left", "right"):
+        lw, lh = int(150 * scale), int(94 * scale)
+        gap = int(40 * scale)
+        gx0 = (w - (mw + gap + lw)) // 2
+        if side == "right":
+            mx0, lx0 = gx0, gx0 + mw + gap
+        else:
+            lx0, mx0 = gx0, gx0 + lw + gap
+        laptop = (lx0, desk - int(7 * scale) - lh, lw, lh)
+        left, right = gx0, gx0 + mw + gap + lw
+    else:
+        mx0 = (w - mw) // 2
+        left, right = mx0, mx0 + mw
+    return {"mon": (mx0, my0, mw, mh), "laptop": laptop, "desk": desk, "left": left, "right": right}
+
+
+def _blend(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def _paint_art(img, d, art, rect, scale):
+    """Draw a static picture of what is driving the lights on the monitor screen."""
+    x0, y0, mw, mh = rect
+    screen = (24, 20, 34)
+    d.rectangle((x0, y0, x0 + mw, y0 + mh), fill=screen)
+    kind = art.get("kind")
+    cols = art.get("colors") or []
+    if kind == "screen" and cols:
+        n, gap = 7, max(1, int(2 * scale))
+        bw = (mw - gap * (n - 1)) / n
+        for i in range(n):
+            t = i / (n - 1)
+            pos = t * (len(cols) - 1)
+            j = min(int(pos), len(cols) - 2) if len(cols) > 1 else 0
+            col = cols[0] if len(cols) == 1 else _blend(cols[j], cols[j + 1], pos - j)
+            bx = x0 + i * (bw + gap)
+            d.rectangle((bx, y0, bx + bw, y0 + mh), fill=_blend(screen, col, 0.8))
+    elif kind == "music":
+        cols = cols or [_rgb(FILAMENT)]
+        n = len(EQ_LEVELS)
+        gap = max(2, int(4 * scale))
+        pad = int(16 * scale)
+        bw = (mw - 2 * pad - gap * (n - 1)) / n
+        base = y0 + mh - int(14 * scale)
+        for i, v in enumerate(EQ_LEVELS):
+            t = i / (n - 1)
+            col = cols[0] if len(cols) == 1 else _blend(cols[0], cols[-1], t)
+            bh = int((mh - int(34 * scale)) * v)
+            bx = x0 + pad + i * (bw + gap)
+            d.rounded_rectangle((bx, base - bh, bx + bw, base), radius=max(1, int(2 * scale)), fill=col)
+        d.line((x0 + pad, base + int(4 * scale), x0 + mw - pad, base + int(4 * scale)),
+               fill=(70, 62, 92), width=max(1, int(scale)))
+    elif kind == "scene":
+        a, b = art["colors"]
+        r = int(13 * scale)
+        cy = y0 + int(mh * 0.36)
+        for cx, col in ((x0 + mw // 2 - int(17 * scale), a), (x0 + mw // 2 + int(17 * scale), b)):
+            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=col)
+    elif kind == "manual":
+        items = art["items"]
+        n = len(items)
+        size = int((44 if n == 1 else 34) * scale)
+        step = size + int(40 * scale)
+        cx0 = x0 + mw / 2 - step * (n - 1) / 2
+        cy = y0 + int(mh * 0.38)
+        for i, (col, _) in enumerate(items):
+            cx = cx0 + i * step
+            d.rounded_rectangle((cx - size / 2, cy - size / 2, cx + size / 2, cy + size / 2),
+                                radius=int(9 * scale), fill=col)
+    else:  # everything off: a dark screen and a crescent moon
+        r = int(17 * scale)
+        cx, cy = x0 + mw // 2 - int(10 * scale), y0 + mh // 2
+        d.rectangle((x0, y0, x0 + mw, y0 + mh), fill=(14, 11, 20))
+        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(198, 190, 214))
+        o = int(8 * scale)
+        d.ellipse((cx - r + o, cy - r - o // 2, cx + r + o, cy + r - o // 2), fill=(14, 11, 20))
+
+
+def _paint_laptop(d, rect, desk, scale):
+    lx0, ly0, lw, lh = rect
+    bez = max(2, int(4 * scale))
+    d.rounded_rectangle((lx0 - bez, ly0 - bez, lx0 + lw + bez, ly0 + lh + bez),
+                        radius=int(6 * scale), fill=(10, 8, 15), outline=(70, 62, 92), width=max(1, int(scale)))
+    d.rectangle((lx0, ly0, lx0 + lw, ly0 + lh), fill=(20, 17, 29))
+    # a quiet desktop: two windows and a taskbar
+    d.rectangle((lx0, ly0 + lh - int(8 * scale), lx0 + lw, ly0 + lh), fill=(33, 28, 46))
+    d.rounded_rectangle((lx0 + int(14 * scale), ly0 + int(14 * scale), lx0 + int(84 * scale),
+                         ly0 + int(58 * scale)), radius=int(3 * scale), fill=(38, 32, 54))
+    d.rounded_rectangle((lx0 + int(64 * scale), ly0 + int(30 * scale), lx0 + int(134 * scale),
+                         ly0 + int(76 * scale)), radius=int(3 * scale), fill=(46, 39, 64))
+    lip = int(14 * scale)
+    d.polygon([(lx0 - bez, desk - int(7 * scale)), (lx0 + lw + bez, desk - int(7 * scale)),
+               (lx0 + lw + bez + lip, desk), (lx0 - bez - lip, desk)], fill=(52, 46, 70))
+
+
+def render_room(w, h, bulbs, art, scale=1.0, side=None):
     """
-    Draw the room scene: the monitor in the middle with the live screen, bulbs on either
-    side throwing their color onto the wall. bulbs: list of dicts with x, y, color or None, dim.
-    Returns a PIL image.
+    Draw the room scene: the monitor (and the laptop, when Windows shows both displays) with a
+    picture of what drives the lights, bulbs on either side throwing their color onto the wall.
+    bulbs: list of dicts with x, y, color or None, dim. Returns (PIL image, layout).
     """
     bg = _rgb(NIGHT)
     q = 4  # paint the light wash at quarter size, then blur and scale up (fast and soft)
@@ -883,44 +999,32 @@ def render_room(w, h, bulbs, thumb, scale=1.0):
     img = wash.resize((w, h), PILImage.BILINEAR)
     d = PILDraw.Draw(img)
 
+    lay = room_layout(w, h, scale, side)
+    mx0, my0, mw, mh = lay["mon"]
+    if lay["laptop"]:
+        _paint_laptop(d, lay["laptop"], lay["desk"], scale)
+
     # monitor
-    mw, mh = int(250 * scale), int(141 * scale)
-    mx0, my0 = (w - mw) // 2, int(h * 0.40 - mh / 2)
     bez = max(2, int(5 * scale))
     d.rounded_rectangle((mx0 - bez, my0 - bez, mx0 + mw + bez, my0 + mh + bez),
                         radius=int(7 * scale), fill=(10, 8, 15), outline=(70, 62, 92), width=max(1, int(scale)))
-    if thumb is not None and np.ndim(thumb) == 3:
-        t = PILImage.fromarray(np.ascontiguousarray(thumb)).resize((mw, mh), PILImage.BILINEAR)
-        img.paste(t, (mx0, my0))
-    else:
-        d.rectangle((mx0, my0, mx0 + mw, my0 + mh), fill=(24, 20, 34))
-        if thumb is not None:  # music: spectrum bars in the bulbs' colors
-            n = len(thumb)
-            lit = [b["color"] for b in bulbs if b["color"]] or [_rgb(FILAMENT)]
-            gap = max(1, int(2 * scale))
-            bw = (mw - gap * (n + 1)) / n
-            for i, v in enumerate(thumb):
-                col = lit[0] if len(lit) == 1 else tuple(
-                    int(lit[0][c] + (lit[-1][c] - lit[0][c]) * i / max(1, n - 1)) for c in range(3))
-                bh = max(int(2 * scale), int((mh - 12 * scale) * float(v)))
-                x0 = mx0 + gap + i * (bw + gap)
-                d.rectangle((x0, my0 + mh - 6 * scale - bh, x0 + bw, my0 + mh - 6 * scale), fill=col)
+    _paint_art(img, d, art, lay["mon"], scale)
     # stand
-    sx = w // 2
+    sx = mx0 + mw // 2
     d.rectangle((sx - int(7 * scale), my0 + mh + bez, sx + int(7 * scale), my0 + mh + int(24 * scale)),
                 fill=(52, 46, 70))
     d.rounded_rectangle((sx - int(46 * scale), my0 + mh + int(22 * scale),
-                         sx + int(46 * scale), my0 + mh + int(28 * scale)),
-                        radius=int(3 * scale), fill=(52, 46, 70))
+                         sx + int(46 * scale), lay["desk"]), radius=int(3 * scale), fill=(52, 46, 70))
 
     # outline of the screen area each bulb follows, in that bulb's color
-    for i, b in enumerate(bulbs):
-        if not b["color"] or thumb is None or np.ndim(thumb) != 3 or not b.get("sync", True):
-            continue
-        inset = i * max(2, int(2 * scale))
-        x0, y0, x1, y1 = zone_box(b["zone"], mx0, my0, mx0 + mw, my0 + mh)
-        d.rectangle((x0 + inset, y0 + inset, x1 - inset - 1, y1 - inset - 1),
-                    outline=b["color"], width=max(2, int(2 * scale)))
+    if art.get("kind") == "screen":
+        for i, b in enumerate(bulbs):
+            if not b["color"] or not b.get("sync", True):
+                continue
+            inset = i * max(2, int(2 * scale))
+            x0, y0, x1, y1 = zone_box(b["zone"], mx0, my0, mx0 + mw, my0 + mh)
+            d.rectangle((x0 + inset, y0 + inset, x1 - inset - 1, y1 - inset - 1),
+                        outline=b["color"], width=max(2, int(2 * scale)))
 
     # bulbs
     for b in bulbs:
@@ -937,7 +1041,7 @@ def render_room(w, h, bulbs, thumb, scale=1.0):
         # screw base
         d.rounded_rectangle((cx - int(9 * scale), cy + r - int(2 * scale), cx + int(9 * scale),
                              cy + r + int(9 * scale)), radius=int(2 * scale), fill=(110, 102, 128))
-    return img, (mx0, my0, mw, mh)
+    return img, lay
 
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -1133,6 +1237,7 @@ class App(ctk.CTk):
         self._scene_btns = {}
         self._current_scene = None
         self.display = {}            # ip -> (rgb or None, dim, words) when nothing is syncing
+        self.side_display = None     # "left" or "right" when Windows shows a second display
         self.status_text = ""
         self.slider_widgets = {}
         self._save_job = None
@@ -1155,6 +1260,7 @@ class App(ctk.CTk):
         self._show_page("Lights")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(200, self._tick)
+        threading.Thread(target=self._watch_displays, daemon=True).start()
         self.after(300, self._poll_states)
 
         if not self.settings["bulbs"]:
@@ -1327,17 +1433,43 @@ class App(ctk.CTk):
         sides = {"left": [], "right": []}
         for i, (ip, b) in enumerate(bulbs):
             sides[bulb_side(b.get("zone", "Full screen"), i)].append((ip, b))
+        lay = room_layout(w, h, scale, self.side_display)
+        room_each_side = lay["left"] - 60 * scale     # same on both sides, the desk is centered
         out = []
-        mon_half = 125 * scale
         for side, items in sides.items():
+            if not items:
+                continue
+            step = min(150 * scale, max(70 * scale, room_each_side / len(items)))
             for j, (ip, b) in enumerate(items):
-                gap = 150 * scale + j * 150 * scale
-                x = w / 2 - mon_half - gap if side == "left" else w / 2 + mon_half + gap
+                gap = step * (j + 1)
+                x = lay["left"] - gap if side == "left" else lay["right"] + gap
                 color, dim, words = self._bulb_look(ip)
                 out.append({"ip": ip, "name": b.get("name", ip), "zone": b.get("zone", "Full screen"),
                             "x": int(x), "y": int(h * 0.36), "color": color, "dim": dim, "words": words,
                             "sync": b.get("enabled", True)})
         return out
+
+    def _monitor_art(self, bulbs):
+        """Describe what is driving the lights, for the picture on the monitor."""
+        if self._is_syncing():
+            lit = [b["color"] for b in sorted(bulbs, key=lambda b: b["x"]) if b["color"] and b["sync"]]
+            return {"kind": "screen" if self.engine.kind == "Screen" else "music", "colors": lit}
+        looks = {}
+        for b in sorted(bulbs, key=lambda b: b["x"]):
+            if not b["color"]:
+                continue
+            label = b["words"] or "On"
+            if label == "Color":
+                label = hue_name(b["color"])
+            looks.setdefault(label, b["color"])
+        if not looks:
+            return {"kind": "off"}
+        if len(looks) == 1:
+            label = next(iter(looks))
+            if label in SCENE_IDS:
+                return {"kind": "scene", "name": label, "colors": SCENE_LOOK[SCENE_IDS[label]]}
+        items = [(SCENE_LOOK[SCENE_IDS[k]][0] if k in SCENE_IDS else v, k) for k, v in looks.items()]
+        return {"kind": "manual", "items": items[:3]}
 
     def _draw_room(self):
         c = self.room
@@ -1346,8 +1478,9 @@ class App(ctk.CTk):
         scale = h / self.room_h
         bulbs = self._room_bulbs(w, h, scale)
         c.delete("all")
-        thumb = self.engine.preview if self._is_syncing() else None
-        img, (mx0, my0, mw, mh) = render_room(w, h, bulbs, thumb, scale)
+        art = self._monitor_art(bulbs)
+        img, lay = render_room(w, h, bulbs, art, scale, self.side_display)
+        mx0, my0, mw, mh = lay["mon"]
         self._hero_img = ImageTk.PhotoImage(img)
         c.create_image(0, 0, image=self._hero_img, anchor="nw")
 
@@ -1361,9 +1494,10 @@ class App(ctk.CTk):
                 if b["color"]:
                     detail += f", {b['dim']}%"
             else:
-                detail = b["words"] or ""
-                if b["color"] and b["words"] not in ("Off", ""):
-                    detail = f"{b['words']}, {b['dim']}%"
+                words = hue_name(b["color"]) if b["words"] == "Color" and b["color"] else b["words"]
+                detail = words or ""
+                if b["color"] and words not in ("Off", ""):
+                    detail = f"{words}, {b['dim']}%"
             c.create_text(b["x"], b["y"] + 64 * scale, text=detail, fill="#C9C0DC", font=info_font)
 
         if syncing:
@@ -1382,10 +1516,53 @@ class App(ctk.CTk):
             caption += f". {self._key_name(key)} off in {mins} min"
         c.create_text(w / 2, my0 + mh + 46 * scale, text=caption, fill=MUTED, font=info_font,
                       width=w - 80)
-        if thumb is None:
-            msg = "Your screen or music shows here while syncing"
-            c.create_text(w / 2, my0 + mh / 2, text=msg, fill=MUTED, font=info_font, width=mw - 30,
-                          justify="center")
+        self._draw_art_text(c, art, lay["mon"], scale)
+
+    def _watch_displays(self):
+        """Every few seconds, see whether Windows shows another display and on which side."""
+        try:
+            import mss
+            grabber = getattr(mss, "MSS", None) or mss.mss
+        except Exception:
+            return
+        while not self._quitting:
+            side = None
+            try:
+                with grabber() as sct:
+                    mons = sct.monitors[1:]
+                idx = self.settings["monitor"]
+                cap = mons[idx - 1] if 0 < idx <= len(mons) else mons[0]
+                others = [m for m in mons if m is not cap]
+                if others:
+                    o = others[0]
+                    dx = (o["left"] + o["width"] / 2) - (cap["left"] + cap["width"] / 2)
+                    side = "left" if dx < 0 else "right"
+            except Exception:
+                side = None
+            if side != self.side_display:
+                self.side_display = side
+                self.ui_queue.put(self._draw_room)
+            time.sleep(4)
+
+    def _draw_art_text(self, c, art, rect, scale):
+        x0, y0, mw, mh = rect
+        cx = x0 + mw / 2
+        kind = art["kind"]
+        title = (self.display_bold, max(9, int(15 * scale)))
+        small = (self.f_small.cget("family"), max(8, int(10 * scale)))
+        if kind == "scene":
+            c.create_text(cx, y0 + mh * 0.68, text=art["name"], fill=MOON, font=title)
+        elif kind == "manual":
+            n = len(art["items"])
+            size = (44 if n == 1 else 34) * scale
+            step = size + 40 * scale
+            for i, (_, label) in enumerate(art["items"]):
+                c.create_text(cx - step * (n - 1) / 2 + i * step, y0 + mh * 0.38 + size / 2 + 16 * scale,
+                              text=label, fill=MOON, font=title if n == 1 else small)
+        elif kind == "off":
+            c.create_text(cx + 26 * scale, y0 + mh / 2 - 14 * scale, text="z z", fill=MUTED, font=small)
+        elif kind == "screen" and not art["colors"]:
+            c.create_text(cx, y0 + mh / 2, text="Waiting for color", fill=MUTED, font=small)
 
     # ------------------------------------------------------------ body: sidebar + pages
     def _build_body(self):
