@@ -13,6 +13,7 @@ Copyright (c) 2026 Mihir Sheth. MIT License, see LICENSE.
 
 import colorsys
 import copy
+import functools
 import json
 import os
 import queue
@@ -842,18 +843,6 @@ def bulb_side(zone, index):
     return "left" if index % 2 == 0 else "right"
 
 
-def zone_box(zone, x0, y0, x1, y1):
-    """Rectangle of the screen area a bulb follows, inside the monitor picture."""
-    w, h = x1 - x0, y1 - y0
-    fr = {
-        "Left half": (0, 0, .5, 1), "Right half": (.5, 0, 1, 1), "Top half": (0, 0, 1, .5),
-        "Bottom half": (0, .5, 1, 1), "Center": (.25, .25, .75, .75), "Top left": (0, 0, .5, .5),
-        "Top right": (.5, 0, 1, .5), "Bottom left": (0, .5, .5, 1), "Bottom right": (.5, .5, 1, 1),
-    }.get(zone, (0, 0, 1, 1))
-    return (x0 + fr[0] * w, y0 + fr[1] * h, x0 + fr[2] * w, y0 + fr[3] * h)
-
-
-SCENE_IDS = {name: sid for sid, name in SCENES.items()}
 EQ_LEVELS = [0.35, 0.6, 0.85, 0.55, 0.72, 0.95, 0.62, 0.42, 0.78, 0.5, 0.3, 0.66, 0.45, 0.25]
 
 
@@ -896,62 +885,75 @@ def _blend(a, b, t):
     return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
-def _paint_art(img, d, art, rect, scale):
-    """Draw a static picture of what is driving the lights on the monitor screen."""
-    x0, y0, mw, mh = rect
-    screen = (24, 20, 34)
-    d.rectangle((x0, y0, x0 + mw, y0 + mh), fill=screen)
+def art_key(art):
+    """A hashable version of the monitor picture, so each picture is drawn only once."""
     kind = art.get("kind")
-    cols = art.get("colors") or []
-    if kind == "screen" and cols:
-        n, gap = 7, max(1, int(2 * scale))
-        bw = (mw - gap * (n - 1)) / n
-        for i in range(n):
-            t = i / (n - 1)
-            pos = t * (len(cols) - 1)
-            j = min(int(pos), len(cols) - 2) if len(cols) > 1 else 0
-            col = cols[0] if len(cols) == 1 else _blend(cols[j], cols[j + 1], pos - j)
-            bx = x0 + i * (bw + gap)
-            d.rectangle((bx, y0, bx + bw, y0 + mh), fill=_blend(screen, col, 0.8))
+    if kind == "scene":
+        return kind, art["name"], tuple(art["colors"])
+    if kind == "manual":
+        return kind, tuple((tuple(c), label) for c, label in art["items"])
+    return (kind,)
+
+
+@functools.lru_cache(maxsize=24)
+def art_image(key, mw, mh, scale):
+    """Draw the still picture shown on the monitor for what is driving the lights."""
+    kind = key[0]
+    screen = (14, 11, 20) if kind == "off" else (24, 20, 34)
+    img = PILImage.new("RGB", (mw + 1, mh + 1), screen)
+    d = PILDraw.Draw(img)
+    amber, rose = _rgb(FILAMENT), _rgb(ROSE)
+    cx = mw // 2
+    if kind == "screen":   # a small screen with a play mark, throwing light to both sides
+        sw, sh = int(58 * scale), int(36 * scale)
+        cy = int(mh * 0.38)
+        lw = max(2, int(3 * scale))
+        d.rounded_rectangle((cx - sw // 2, cy - sh // 2, cx + sw // 2, cy + sh // 2),
+                            radius=int(6 * scale), outline=amber, width=lw)
+        t = int(9 * scale)
+        d.polygon([(cx - t * 0.7, cy - t), (cx - t * 0.7, cy + t), (cx + t, cy)], fill=amber)
+        for sign in (-1, 1):
+            ex = cx + sign * (sw // 2 + int(9 * scale))
+            for dy in (-1, 0, 1):
+                d.line((ex, cy + dy * int(9 * scale), ex + sign * int(13 * scale),
+                        cy + dy * int(15 * scale)), fill=amber, width=lw)
     elif kind == "music":
-        cols = cols or [_rgb(FILAMENT)]
         n = len(EQ_LEVELS)
         gap = max(2, int(4 * scale))
         pad = int(16 * scale)
         bw = (mw - 2 * pad - gap * (n - 1)) / n
-        base = y0 + mh - int(14 * scale)
+        base = mh - int(14 * scale)
         for i, v in enumerate(EQ_LEVELS):
-            t = i / (n - 1)
-            col = cols[0] if len(cols) == 1 else _blend(cols[0], cols[-1], t)
             bh = int((mh - int(34 * scale)) * v)
-            bx = x0 + pad + i * (bw + gap)
-            d.rounded_rectangle((bx, base - bh, bx + bw, base), radius=max(1, int(2 * scale)), fill=col)
-        d.line((x0 + pad, base + int(4 * scale), x0 + mw - pad, base + int(4 * scale)),
+            bx = pad + i * (bw + gap)
+            d.rounded_rectangle((bx, base - bh, bx + bw, base), radius=max(1, int(2 * scale)),
+                                fill=_blend(amber, rose, i / (n - 1)))
+        d.line((pad, base + int(4 * scale), mw - pad, base + int(4 * scale)),
                fill=(70, 62, 92), width=max(1, int(scale)))
     elif kind == "scene":
-        a, b = art["colors"]
+        a, b = key[2]
         r = int(13 * scale)
-        cy = y0 + int(mh * 0.36)
-        for cx, col in ((x0 + mw // 2 - int(17 * scale), a), (x0 + mw // 2 + int(17 * scale), b)):
-            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=col)
+        cy = int(mh * 0.36)
+        for x, col in ((cx - int(17 * scale), a), (cx + int(17 * scale), b)):
+            d.ellipse((x - r, cy - r, x + r, cy + r), fill=col)
     elif kind == "manual":
-        items = art["items"]
+        items = key[1]
         n = len(items)
         size = int((44 if n == 1 else 34) * scale)
         step = size + int(40 * scale)
-        cx0 = x0 + mw / 2 - step * (n - 1) / 2
-        cy = y0 + int(mh * 0.38)
+        cx0 = cx - step * (n - 1) / 2
+        cy = int(mh * 0.38)
         for i, (col, _) in enumerate(items):
-            cx = cx0 + i * step
-            d.rounded_rectangle((cx - size / 2, cy - size / 2, cx + size / 2, cy + size / 2),
+            x = cx0 + i * step
+            d.rounded_rectangle((x - size / 2, cy - size / 2, x + size / 2, cy + size / 2),
                                 radius=int(9 * scale), fill=col)
-    else:  # everything off: a dark screen and a crescent moon
+    else:  # everything off: a crescent moon
         r = int(17 * scale)
-        cx, cy = x0 + mw // 2 - int(10 * scale), y0 + mh // 2
-        d.rectangle((x0, y0, x0 + mw, y0 + mh), fill=(14, 11, 20))
-        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(198, 190, 214))
+        x, cy = cx - int(10 * scale), mh // 2
+        d.ellipse((x - r, cy - r, x + r, cy + r), fill=(198, 190, 214))
         o = int(8 * scale)
-        d.ellipse((cx - r + o, cy - r - o // 2, cx + r + o, cy + r - o // 2), fill=(14, 11, 20))
+        d.ellipse((x - r + o, cy - r - o // 2, x + r + o, cy + r - o // 2), fill=screen)
+    return img
 
 
 def _paint_laptop(d, rect, desk, scale):
@@ -1008,23 +1010,13 @@ def render_room(w, h, bulbs, art, scale=1.0, side=None):
     bez = max(2, int(5 * scale))
     d.rounded_rectangle((mx0 - bez, my0 - bez, mx0 + mw + bez, my0 + mh + bez),
                         radius=int(7 * scale), fill=(10, 8, 15), outline=(70, 62, 92), width=max(1, int(scale)))
-    _paint_art(img, d, art, lay["mon"], scale)
+    img.paste(art_image(art_key(art), mw, mh, round(scale, 3)), (mx0, my0))
     # stand
     sx = mx0 + mw // 2
     d.rectangle((sx - int(7 * scale), my0 + mh + bez, sx + int(7 * scale), my0 + mh + int(24 * scale)),
                 fill=(52, 46, 70))
     d.rounded_rectangle((sx - int(46 * scale), my0 + mh + int(22 * scale),
                          sx + int(46 * scale), lay["desk"]), radius=int(3 * scale), fill=(52, 46, 70))
-
-    # outline of the screen area each bulb follows, in that bulb's color
-    if art.get("kind") == "screen":
-        for i, b in enumerate(bulbs):
-            if not b["color"] or not b.get("sync", True):
-                continue
-            inset = i * max(2, int(2 * scale))
-            x0, y0, x1, y1 = zone_box(b["zone"], mx0, my0, mx0 + mw, my0 + mh)
-            d.rectangle((x0 + inset, y0 + inset, x1 - inset - 1, y1 - inset - 1),
-                        outline=b["color"], width=max(2, int(2 * scale)))
 
     # bulbs
     for b in bulbs:
@@ -1452,8 +1444,7 @@ class App(ctk.CTk):
     def _monitor_art(self, bulbs):
         """Describe what is driving the lights, for the picture on the monitor."""
         if self._is_syncing():
-            lit = [b["color"] for b in sorted(bulbs, key=lambda b: b["x"]) if b["color"] and b["sync"]]
-            return {"kind": "screen" if self.engine.kind == "Screen" else "music", "colors": lit}
+            return {"kind": "screen" if self.engine.kind == "Screen" else "music"}
         looks = {}
         for b in sorted(bulbs, key=lambda b: b["x"]):
             if not b["color"]:
@@ -1561,8 +1552,8 @@ class App(ctk.CTk):
                               text=label, fill=MOON, font=title if n == 1 else small)
         elif kind == "off":
             c.create_text(cx + 26 * scale, y0 + mh / 2 - 14 * scale, text="z z", fill=MUTED, font=small)
-        elif kind == "screen" and not art["colors"]:
-            c.create_text(cx, y0 + mh / 2, text="Waiting for color", fill=MUTED, font=small)
+        elif kind == "screen":
+            c.create_text(cx, y0 + mh * 0.72, text="Screen sync", fill=MOON, font=title)
 
     # ------------------------------------------------------------ body: sidebar + pages
     def _build_body(self):
@@ -2422,8 +2413,6 @@ class App(ctk.CTk):
         bar = ctk.CTkFrame(page, fg_color="transparent")
         bar.pack(fill="x", padx=18, pady=(16, 0))
         ctk.CTkLabel(bar, text="Lights", font=self.f_head, text_color=MOON).pack(side="left")
-        self._button(bar, "Control all lights", lambda: self._open_detail("all"), width=150,
-                     primary=True).pack(side="left", padx=16)
         self.find_btn = self._button(bar, "Find lights", self._discover, width=110)
         self.find_btn.pack(side="right")
         self._button(bar, "Add", self._add_ip, width=60).pack(side="right", padx=(6, 12))
@@ -2924,7 +2913,7 @@ class App(ctk.CTk):
         self._paint_dots()
 
     def _tick(self):
-        while True:
+        while not self._quitting:
             try:
                 self.ui_queue.get_nowait()()
             except queue.Empty:
@@ -3005,7 +2994,13 @@ class App(ctk.CTk):
         self._quitting = True
         if self.fade_job and self.fade_job.is_alive():
             self.fade_job.cancel()
-        self._stop()
+        self._stop(restore=False)
+        # leave every light on the Cozy scene at full brightness
+        params, _ = scene_cmd(SCENE_IDS["Cozy"], 100, self.settings["scene_speed"])
+        for _ in range(2):          # UDP can drop a packet, so send it twice
+            for ip in self.settings["bulbs"]:
+                bulb_send(self.cmd_sock, ip, params)
+            time.sleep(0.05)
         save_settings(self.get_settings())
         if self.tray:
             try:
