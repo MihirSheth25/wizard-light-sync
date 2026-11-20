@@ -88,9 +88,19 @@ DEFAULTS = {
     "schedules": [],                  # see ScheduleDialog for the fields
     "rooms": [],                      # {"id", "name", "lights": [ip, ...]}
     "bulbs": {},  # ip -> {"name", "enabled", "zone", "brightness_scale"}
+    "screen_presets": {},             # name -> every screen sync setting (SCREEN_KEYS)
+    "screen_preset": "Default",       # the preset picked last
 }
 
-PRESETS = {
+# The settings a screen sync preset holds (everything on that page except which monitor)
+SCREEN_KEYS = ("color_mode", "saturation", "smoothing", "fps", "change_threshold", "brightness_mode",
+               "min_brightness", "max_brightness", "brightness_gain", "fixed_brightness", "dark_scene",
+               "dark_threshold", "ignore_black_bars", "crop_top", "crop_bottom", "crop_left", "crop_right",
+               "sample_step")
+MUSIC_KEYS = tuple(k for k in DEFAULTS if k.startswith("music_"))
+
+# The presets the app starts with; each only lists what differs from the defaults
+STARTER_PRESETS = {
     "Movie": {"smoothing": 0.7, "saturation": 1.6, "fps": 10, "color_mode": "Vivid",
               "brightness_mode": "Follow screen", "max_brightness": 80, "brightness_gain": 2.5},
     "Gaming": {"smoothing": 0.2, "saturation": 2.2, "fps": 20, "color_mode": "Vivid",
@@ -132,6 +142,16 @@ def load_settings():
                 data[k] = v
     except (OSError, ValueError):
         pass
+    base = {k: DEFAULTS[k] for k in SCREEN_KEYS}
+    if not data["screen_presets"]:      # first run with presets: keep today's settings as Default
+        data["screen_presets"] = {"Default": {k: data[k] for k in SCREEN_KEYS}}
+        for name, diff in STARTER_PRESETS.items():
+            data["screen_presets"][name] = {**base, **diff}
+        data["screen_preset"] = "Default"
+    for name, values in data["screen_presets"].items():
+        data["screen_presets"][name] = {**base, **{k: v for k, v in values.items() if k in SCREEN_KEYS}}
+    if data["screen_preset"] not in data["screen_presets"]:
+        data["screen_preset"] = next(iter(data["screen_presets"]), "Default")
     for i, sc in enumerate(data["schedules"]):    # every schedule needs an id to edit or delete it
         sc.setdefault("id", f"s{i}")
     return data
@@ -1229,6 +1249,7 @@ class App(ctk.CTk):
         self._scene_btns = {}
         self._current_scene = None
         self.display = {}            # ip -> (rgb or None, dim, words) when nothing is syncing
+        self._preset_ui_pending = False
         self.side_display = None     # "left" or "right" when Windows shows a second display
         self.status_text = ""
         self.slider_widgets = {}
@@ -1319,6 +1340,9 @@ class App(ctk.CTk):
         with self.lock:
             self.settings[key] = value
         self._schedule_save()
+        if key in SCREEN_KEYS and not self._preset_ui_pending and hasattr(self, "preset_status"):
+            self._preset_ui_pending = True
+            self.after_idle(self._update_preset_ui)
 
     def set_bulb(self, ip, key, value):
         with self.lock:
@@ -1357,9 +1381,17 @@ class App(ctk.CTk):
 
     def _slider_widget(self, parent, lo, hi, steps, command, width=None):
         kw = {"width": width} if width else {}
-        return ctk.CTkSlider(parent, from_=lo, to=hi, number_of_steps=steps, command=command,
-                             fg_color=LINE, progress_color=FILAMENT, button_color=FILAMENT,
-                             button_hover_color=FILAMENT_HOVER, height=16, **kw)
+        sl = ctk.CTkSlider(parent, from_=lo, to=hi, number_of_steps=steps, command=command,
+                           fg_color=LINE, progress_color=FILAMENT, button_color=FILAMENT,
+                           button_hover_color=FILAMENT_HOVER, height=16, **kw)
+        # the mouse wheel scrolls the page only; it never moves a slider
+        canvas = getattr(sl, "_canvas", None)
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                canvas.unbind(seq)
+            except Exception:
+                pass
+        return sl
 
     def _segmented(self, parent, values, command, current):
         seg = ctk.CTkSegmentedButton(parent, values=values, fg_color=RAISED, selected_color=FILAMENT,
@@ -2299,9 +2331,27 @@ class App(ctk.CTk):
         top = ctk.CTkFrame(sf, fg_color="transparent")
         top.pack(fill="x", padx=18, pady=(14, 0))
         ctk.CTkLabel(top, text="Screen sync", font=self.f_head, text_color=MOON).pack(side="left")
-        self.preset_menu = self._menu(top, ["Presets"] + list(PRESETS), self._apply_preset, width=140)
-        self.preset_menu.set("Presets")
-        self.preset_menu.pack(side="right")
+        self._confirm_button(top, "Reset to defaults", self._reset_screen).pack(side="right")
+
+        g = self._group(sf, "Presets", "Pick a preset to load its settings. After changing anything below, "
+                                       "save it to that preset or as a new one.")
+        row = ctk.CTkFrame(g, fg_color="transparent")
+        row.pack(fill="x", pady=(8, 0))
+        self.preset_box = ctk.CTkFrame(row, fg_color="transparent", width=200, height=34)
+        self.preset_box.pack(side="left")
+        self.preset_box.pack_propagate(False)
+        self.preset_menu = self._menu(self.preset_box, list(self.settings["screen_presets"]),
+                                      self._pick_preset, width=200)
+        self.preset_menu.pack(fill="both", expand=True)
+        self.preset_entry = None
+        self.preset_save = self._button(row, "Save", self._save_preset, width=70, primary=True)
+        self.preset_save.pack(side="left", padx=(12, 0))
+        self._button(row, "Save as new", self._new_preset, width=110).pack(side="left", padx=(8, 0))
+        self.preset_delete = self._confirm_button(row, "Delete", self._delete_preset, width=70)
+        self.preset_delete.pack(side="left", padx=(8, 0))
+        self.preset_status = self._label(g, "", muted=True, anchor="w")
+        self.preset_status.pack(anchor="w", pady=(6, 0))
+        self._update_preset_ui()
 
         g = self._group(sf, "Color", "How the app turns your screen into one color for each bulb.")
         self._choice(g, "Color mode", "color_mode", COLOR_MODES,
@@ -2381,6 +2431,7 @@ class App(ctk.CTk):
         sf = self._scroll(page)
         g = self._group(sf, "Music sync", "The bulbs react to whatever is playing on this PC: Spotify, YouTube, "
                                           "games. Pick Music next to Start sync at the top.")
+        self._confirm_button(g, "Reset to defaults", self._reset_music).place(relx=1.0, y=0, anchor="ne")
         if not self._soundcard_ok():
             ctk.CTkLabel(g, text="Music sync needs one more package. Run  pip install soundcard  and restart "
                                  "the app.", wraplength=620, justify="left", text_color=ROSE,
@@ -2834,7 +2885,9 @@ class App(ctk.CTk):
     def _reset(self):
         with self.lock:
             bulbs, schedules, rooms = self.settings["bulbs"], self.settings["schedules"], self._rooms()
+            presets = self.settings["screen_presets"]
             self.settings = copy.deepcopy(DEFAULTS)
+            self.settings["screen_presets"] = presets
             self.settings["bulbs"] = {ip: {"name": b.get("name", ip), "enabled": True,
                                            "zone": "Full screen", "brightness_scale": 100}
                                       for ip, b in bulbs.items()}
@@ -2846,14 +2899,136 @@ class App(ctk.CTk):
         self._schedule_save()
 
     # ------------------------------------------------------------ presets
-    def _apply_preset(self, name):
-        if name not in PRESETS:
+    def _confirm_button(self, parent, text, action, width=None):
+        """A button that asks for a second click before it does something it cannot undo."""
+        btn = self._ghost_button(parent, text, None, color=ROSE, width=width or max(80, len(text) * 8))
+        state = {"armed": False, "job": None}
+
+        def disarm():
+            state["armed"], state["job"] = False, None
+            if btn.winfo_exists():
+                btn.configure(text=text)
+
+        def click():
+            if state["armed"]:
+                if state["job"]:
+                    btn.after_cancel(state["job"])
+                disarm()
+                action()
+            else:
+                state["armed"] = True
+                btn.configure(text="Click again to confirm" if len(text) > 8 else "Sure?")
+                state["job"] = btn.after(3000, disarm)
+
+        btn.configure(command=click)
+        return btn
+
+    def _screen_values(self):
+        with self.lock:
+            return {k: copy.deepcopy(self.settings[k]) for k in SCREEN_KEYS}
+
+    def _preset_changed(self):
+        preset = self.settings["screen_presets"].get(self.settings["screen_preset"])
+        if preset is None:
+            return True
+        for k, v in self._screen_values().items():
+            a = preset.get(k)
+            if isinstance(v, float) or isinstance(a, float):
+                if a is None or abs(float(v) - float(a)) > 1e-6:
+                    return True
+            elif v != a:
+                return True
+        return False
+
+    def _update_preset_ui(self):
+        self._preset_ui_pending = False
+        if not hasattr(self, "preset_status"):
+            return
+        name = self.settings["screen_preset"]
+        self.preset_menu.configure(values=list(self.settings["screen_presets"]))
+        self.preset_menu.set(name)
+        changed = self._preset_changed()
+        if changed:
+            self.preset_status.configure(text=f"Changed since you picked {name}. Save to keep it.",
+                                         text_color=FILAMENT)
+        else:
+            self.preset_status.configure(text=f"Using the {name} preset.", text_color=MUTED)
+        self.preset_save.configure(state="normal" if changed else "disabled",
+                                   fg_color=FILAMENT if changed else RAISED,
+                                   text_color=NIGHT if changed else MUTED)
+        self.preset_delete.configure(state="disabled" if name == "Default" else "normal",
+                                     text_color=LINE if name == "Default" else ROSE)
+
+    def _pick_preset(self, name):
+        values = self.settings["screen_presets"].get(name)
+        if values is None:
             return
         with self.lock:
-            self.settings.update(PRESETS[name])
+            self.settings.update(copy.deepcopy(values))
+            self.settings["screen_preset"] = name
         self._sync_widgets()
         self._schedule_save()
-        self.preset_menu.set(name)
+
+    def _save_preset(self):
+        values = self._screen_values()
+        with self.lock:
+            self.settings["screen_presets"][self.settings["screen_preset"]] = values
+        self._schedule_save()
+        self._update_preset_ui()
+
+    def _new_preset(self):
+        if self.preset_entry is not None:
+            self.preset_entry.focus_set()
+            return
+        self.preset_menu.pack_forget()
+        e = self.preset_entry = ctk.CTkEntry(self.preset_box, height=34, corner_radius=8, fg_color=RAISED,
+                                             border_color=FILAMENT, border_width=1, text_color=MOON,
+                                             placeholder_text="Name the new preset",
+                                             placeholder_text_color=MUTED, font=self.f_body)
+        e.pack(fill="both", expand=True)
+        e.bind("<Return>", lambda ev: self._finish_new_preset(True))
+        e.bind("<Escape>", lambda ev: self._finish_new_preset(False))
+        e.bind("<FocusOut>", lambda ev: self._finish_new_preset(True))
+        self.preset_status.configure(text="Type a name and press Enter. Esc cancels.", text_color=MUTED)
+        self.after(30, lambda: e.winfo_exists() and e.focus_set())
+
+    def _finish_new_preset(self, keep):
+        e, self.preset_entry = self.preset_entry, None
+        if e is None:
+            return
+        name = " ".join(e.get().split())[:30]
+        e.destroy()
+        self.preset_menu.pack(fill="both", expand=True)
+        if keep and name:
+            values = self._screen_values()
+            with self.lock:
+                self.settings["screen_presets"][name] = values
+                self.settings["screen_preset"] = name
+            self._schedule_save()
+        self._update_preset_ui()
+
+    def _delete_preset(self):
+        name = self.settings["screen_preset"]
+        if name == "Default":
+            return
+        with self.lock:
+            self.settings["screen_presets"].pop(name, None)
+            self.settings["screen_preset"] = "Default"
+        self._schedule_save()
+        self._update_preset_ui()
+
+    def _reset_screen(self):
+        """Put every screen sync setting back to how the app ships. Presets are kept."""
+        with self.lock:
+            self.settings.update({k: copy.deepcopy(DEFAULTS[k]) for k in SCREEN_KEYS})
+        self._sync_widgets()
+        self._schedule_save()
+
+    def _reset_music(self):
+        with self.lock:
+            self.settings.update({k: copy.deepcopy(DEFAULTS[k]) for k in MUSIC_KEYS})
+        self._sync_widgets()
+        self._schedule_save()
 
     def _sync_widgets(self):
         for key, (w, extra, fmt) in self.slider_widgets.items():
@@ -2868,6 +3043,7 @@ class App(ctk.CTk):
                 self._recolor_segment(w)
             else:
                 w.set(v)
+        self._update_preset_ui()
 
     # ------------------------------------------------------------ run / stop
     def _is_syncing(self):
