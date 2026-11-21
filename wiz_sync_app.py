@@ -1,12 +1,13 @@
 """
 WiZard
-A desktop app for Philips WiZ bulbs: screen sync, music sync, manual control,
-WiZ scenes, schedules and a sleep timer. Talks to the bulbs directly over Wi-Fi.
+A desktop app for WiZ-compatible smart bulbs (such as Philips Smart LED connected by WiZ):
+screen sync, music sync, manual control, scenes, schedules and a sleep timer.
+Talks to the bulbs directly over your local Wi-Fi network.
 
 Unofficial. Not affiliated with, endorsed by or sponsored by Signify, WiZ or Philips.
 
 Run:   python wiz_sync_app.py
-Needs: pip install customtkinter mss numpy pystray pillow soundcard
+Needs: pip install -r requirements.txt
 
 Copyright (c) 2026 Mihir Sheth. MIT License, see LICENSE.
 """
@@ -600,9 +601,7 @@ class LoopbackAudio:
 
 
 class MusicAnalyzer:
-    """Turns audio blocks into loudness, bass/mid/treble, beats and spectrum bars."""
-
-    BARS = 24
+    """Turns audio blocks into loudness, bass/mid/treble and beats."""
 
     def __init__(self, samplerate=44100):
         self.sr = samplerate
@@ -610,14 +609,13 @@ class MusicAnalyzer:
         self.band_peaks = np.full(3, 1e-3)
         self.bass_avg = 0.0
         self.last_beat = 0.0
-        self.bar_peaks = np.full(self.BARS, 1e-3)
 
     def analyze(self, mono, sensitivity=1.0, now=None):
         now = time.time() if now is None else now
         if mono is None or len(mono) < 64:
             # silence: let everything decay
             self.bass_avg *= 0.95
-            return {"level": 0.0, "bands": np.zeros(3), "beat": False, "bars": np.zeros(self.BARS)}
+            return {"level": 0.0, "bands": np.zeros(3), "beat": False}
         rms = float(np.sqrt(np.mean(mono ** 2)))
         self.peak = max(rms, self.peak * 0.997, 1e-3)
         level = 0.0 if rms < 2e-4 else min(1.0, rms / self.peak)
@@ -639,15 +637,7 @@ class MusicAnalyzer:
         if beat:
             self.last_beat = now
         self.bass_avg = self.bass_avg * 0.9 + bass * 0.1 if self.bass_avg else bass
-
-        # spectrum bars on a log scale for the room picture
-        bar_edges = np.geomspace(40, 12000, self.BARS + 1)
-        bars = np.array([spec[(freqs >= bar_edges[i]) & (freqs < bar_edges[i + 1])].mean()
-                         if np.any((freqs >= bar_edges[i]) & (freqs < bar_edges[i + 1])) else 0.0
-                         for i in range(self.BARS)])
-        self.bar_peaks = np.maximum(bars, self.bar_peaks * 0.99)
-        bars = np.clip(bars / np.maximum(self.bar_peaks, 1e-6), 0, 1) * (1.0 if rms >= 2e-4 else 0)
-        return {"level": level, "bands": norm, "beat": beat, "bars": bars}
+        return {"level": level, "bands": norm, "beat": beat}
 
 
 MUSIC_MODES = ["Beat pulse", "Spectrum", "Mellow"]
@@ -1384,14 +1374,26 @@ class App(ctk.CTk):
         sl = ctk.CTkSlider(parent, from_=lo, to=hi, number_of_steps=steps, command=command,
                            fg_color=LINE, progress_color=FILAMENT, button_color=FILAMENT,
                            button_hover_color=FILAMENT_HOVER, height=16, **kw)
-        # the mouse wheel scrolls the page only; it never moves a slider
+        # the mouse wheel scrolls the page, even with the pointer over a slider; it never moves the slider
         canvas = getattr(sl, "_canvas", None)
-        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            try:
-                canvas.unbind(seq)
-            except Exception:
-                pass
+        if canvas is not None:
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                canvas.bind(seq, lambda e, w=sl: self._scroll_page_from(w, e))
         return sl
+
+    @staticmethod
+    def _scroll_page_from(widget, event):
+        page = widget.master
+        while page is not None and not isinstance(page, ctk.CTkScrollableFrame):
+            page = page.master
+        if page is not None:
+            pc = page._parent_canvas
+            if pc.yview() != (0.0, 1.0):
+                if getattr(event, "num", None) in (4, 5):
+                    pc.yview_scroll(-1 if event.num == 4 else 1, "units")
+                elif event.delta:
+                    pc.yview_scroll(-int(event.delta / 6), "units")
+        return "break"
 
     def _segmented(self, parent, values, command, current):
         seg = ctk.CTkSegmentedButton(parent, values=values, fg_color=RAISED, selected_color=FILAMENT,
@@ -2334,21 +2336,21 @@ class App(ctk.CTk):
         self._confirm_button(top, "Reset to defaults", self._reset_screen).pack(side="right")
 
         g = self._group(sf, "Presets", "Pick a preset to load its settings. After changing anything below, "
-                                       "save it to that preset or as a new one.")
+                                       "click Save to keep it. Pick Create new to make your own.")
         row = ctk.CTkFrame(g, fg_color="transparent")
         row.pack(fill="x", pady=(8, 0))
         self.preset_box = ctk.CTkFrame(row, fg_color="transparent", width=200, height=34)
         self.preset_box.pack(side="left")
         self.preset_box.pack_propagate(False)
-        self.preset_menu = self._menu(self.preset_box, list(self.settings["screen_presets"]),
-                                      self._pick_preset, width=200)
+        self.preset_menu = self._menu(self.preset_box, self._preset_choices(), self._pick_preset, width=200)
         self.preset_menu.pack(fill="both", expand=True)
         self.preset_entry = None
         self.preset_save = self._button(row, "Save", self._save_preset, width=70, primary=True)
         self.preset_save.pack(side="left", padx=(12, 0))
-        self._button(row, "Save as new", self._new_preset, width=110).pack(side="left", padx=(8, 0))
         self.preset_delete = self._confirm_button(row, "Delete", self._delete_preset, width=70)
         self.preset_delete.pack(side="left", padx=(8, 0))
+        self.preset_cancel = self._ghost_button(row, "Cancel", lambda: self._end_new_preset(), color=MOON,
+                                                width=70)
         self.preset_status = self._label(g, "", muted=True, anchor="w")
         self.preset_status.pack(anchor="w", pady=(6, 0))
         self._update_preset_ui()
@@ -2940,12 +2942,19 @@ class App(ctk.CTk):
                 return True
         return False
 
+    NEW_PRESET = "Create new"
+
+    def _preset_choices(self):
+        return list(self.settings["screen_presets"]) + [self.NEW_PRESET]
+
     def _update_preset_ui(self):
         self._preset_ui_pending = False
         if not hasattr(self, "preset_status"):
             return
+        if self.preset_entry is not None:      # making a new preset: Save stays ready
+            return
         name = self.settings["screen_preset"]
-        self.preset_menu.configure(values=list(self.settings["screen_presets"]))
+        self.preset_menu.configure(values=self._preset_choices())
         self.preset_menu.set(name)
         changed = self._preset_changed()
         if changed:
@@ -2953,13 +2962,19 @@ class App(ctk.CTk):
                                          text_color=FILAMENT)
         else:
             self.preset_status.configure(text=f"Using the {name} preset.", text_color=MUTED)
-        self.preset_save.configure(state="normal" if changed else "disabled",
-                                   fg_color=FILAMENT if changed else RAISED,
-                                   text_color=NIGHT if changed else MUTED)
+        self._save_ready(changed)
         self.preset_delete.configure(state="disabled" if name == "Default" else "normal",
                                      text_color=LINE if name == "Default" else ROSE)
 
+    def _save_ready(self, ready):
+        self.preset_save.configure(state="normal" if ready else "disabled",
+                                   fg_color=FILAMENT if ready else RAISED,
+                                   text_color=NIGHT if ready else MUTED)
+
     def _pick_preset(self, name):
+        if name == self.NEW_PRESET:
+            self._new_preset()
+            return
         values = self.settings["screen_presets"].get(name)
         if values is None:
             return
@@ -2970,6 +2985,9 @@ class App(ctk.CTk):
         self._schedule_save()
 
     def _save_preset(self):
+        if self.preset_entry is not None:
+            self._create_preset()
+            return
         values = self._screen_values()
         with self.lock:
             self.settings["screen_presets"][self.settings["screen_preset"]] = values
@@ -2977,6 +2995,7 @@ class App(ctk.CTk):
         self._update_preset_ui()
 
     def _new_preset(self):
+        """Swap the dropdown for a name box. The preset is made when Save is clicked."""
         if self.preset_entry is not None:
             self.preset_entry.focus_set()
             return
@@ -2986,25 +3005,43 @@ class App(ctk.CTk):
                                              placeholder_text="Name the new preset",
                                              placeholder_text_color=MUTED, font=self.f_body)
         e.pack(fill="both", expand=True)
-        e.bind("<Return>", lambda ev: self._finish_new_preset(True))
-        e.bind("<Escape>", lambda ev: self._finish_new_preset(False))
-        e.bind("<FocusOut>", lambda ev: self._finish_new_preset(True))
-        self.preset_status.configure(text="Type a name and press Enter. Esc cancels.", text_color=MUTED)
+        e.bind("<Return>", lambda ev: self.focus_set())
+        e.bind("<Escape>", lambda ev: self._end_new_preset())
+        e.bind("<Key>", lambda ev: ev.keysym != "Escape" and self.preset_status.configure(
+            text="Name it, change the settings below, then click Save.", text_color=FILAMENT))
+        self.preset_delete.pack_forget()
+        self.preset_cancel.pack(side="left", padx=(8, 0))
+        self._save_ready(True)
+        self.preset_status.configure(text="Name it, change the settings below, then click Save.",
+                                     text_color=FILAMENT)
         self.after(30, lambda: e.winfo_exists() and e.focus_set())
 
-    def _finish_new_preset(self, keep):
+    def _create_preset(self):
+        name = " ".join(self.preset_entry.get().split())[:30]
+        problem = None
+        if not name:
+            problem = "Type a name for the preset first."
+        elif name in self.settings["screen_presets"] or name == self.NEW_PRESET:
+            problem = f"There is already a preset called {name}. Pick another name."
+        if problem:
+            self.preset_status.configure(text=problem, text_color=ROSE)
+            self.preset_entry.focus_set()
+            return
+        values = self._screen_values()
+        with self.lock:
+            self.settings["screen_presets"][name] = values
+            self.settings["screen_preset"] = name
+        self._schedule_save()
+        self._end_new_preset()
+
+    def _end_new_preset(self):
         e, self.preset_entry = self.preset_entry, None
         if e is None:
             return
-        name = " ".join(e.get().split())[:30]
         e.destroy()
         self.preset_menu.pack(fill="both", expand=True)
-        if keep and name:
-            values = self._screen_values()
-            with self.lock:
-                self.settings["screen_presets"][name] = values
-                self.settings["screen_preset"] = name
-            self._schedule_save()
+        self.preset_cancel.pack_forget()
+        self.preset_delete.pack(side="left", padx=(8, 0))
         self._update_preset_ui()
 
     def _delete_preset(self):
