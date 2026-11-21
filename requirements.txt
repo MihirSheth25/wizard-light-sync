@@ -1,6 +1,6 @@
-customtkinter
-mss
-numpy
-pillow
-pystray
-soundcard
+customtkinter>=5.2
+mss>=9.0
+numpy>=1.24
+pillow>=10.0
+pystray>=0.19
+soundcard>=0.4

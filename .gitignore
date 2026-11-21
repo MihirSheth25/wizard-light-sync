@@ -1,8 +1,22 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
+venv/
 
 # PyInstaller output
 build/
 dist/
 *.spec
+*.exe
+
+# Personal data: bulb names, IP addresses, rooms, schedules
+settings.json
+settings.json.tmp
+
+# Editors and OS files
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
