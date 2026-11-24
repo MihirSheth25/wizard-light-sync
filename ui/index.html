@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WiZard</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app" class="app">
+  <aside class="side" id="side">
+    <div class="brand">
+      <button class="icon-btn" id="collapse" title="Collapse menu" aria-label="Collapse menu"></button>
+      <span class="brand-name">WiZard</span>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="now" id="now"></div>
+  </aside>
+
+  <main class="main">
+    <header class="top">
+      <h1 class="page-title" id="title">Lights</h1>
+      <div class="top-right">
+        <span class="sync-meta" id="syncMeta"></span>
+        <div class="seg" id="sourceSeg" role="tablist" aria-label="What sync follows"></div>
+        <button class="btn primary" id="syncBtn">Start sync</button>
+      </div>
+    </header>
+    <section class="content" id="content"></section>
+  </main>
+
+  <aside class="drawer" id="drawer" aria-hidden="true"></aside>
+</div>
+<div class="scrim" id="scrim"></div>
+<div class="modal-wrap" id="modal"></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>
