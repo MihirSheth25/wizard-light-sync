@@ -21,7 +21,7 @@ function h(tag, props, ...kids) {
   return el;
 }
 const ICONS = {
-  lights: '<path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.4 1 1.1 1 1.8V16h5v-.3c0-.7.4-1.4 1-1.8A6 6 0 0 0 12 3z"/>',
+  lights: '<path d="M10.8 2.71A6.6 6.6 0 0 0 10.8 15.69M9.2 14.2l1.7 1.5-1.6 1.5M13.2 15.69A6.6 6.6 0 0 0 13.2 2.71M14.8 1.2l-1.7 1.5 1.6 1.5M8 18.7h8M9.4 20.6h5.2M11 22.4h2"/>',
   rooms: '<path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/><path d="M10 20v-5h4v5"/>',
   scenes: '<rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/>',
   screen: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
@@ -501,7 +501,8 @@ function drawStage(cv) {
     } else {
       g.fillStyle = "#23262d"; g.beginPath(); g.arc(b.x, b.y, r, 0, Math.PI * 2); g.fill(); g.strokeStyle = "#353943"; g.stroke();
     }
-    g.fillStyle = "#6d727d"; round(b.x - 8 * sc, b.y + r - 2 * sc, 16 * sc, 10 * sc, 2 * sc); g.fill();
+    g.strokeStyle = b.l.rgb ? "#c9ccd3" : "#4a4f59"; g.lineCap = "round"; g.lineWidth = Math.max(1.5, 2.4 * sc);
+    [[9, 5], [6, 9.5], [3, 14]].forEach(([half, dy]) => { g.beginPath(); g.moveTo(b.x - half * sc, b.y + r + dy * sc); g.lineTo(b.x + half * sc, b.y + r + dy * sc); g.stroke(); });
     if (small) continue;
     g.textAlign = "center"; g.fillStyle = "#e9ebef"; g.font = `600 ${Math.max(11, 13 * sc)}px "Segoe UI Variable Text","Segoe UI",system-ui`;
     g.fillText(b.l.name, b.x, b.y + r + 30 * sc);
@@ -666,7 +667,7 @@ function sceneGrid(getKey, compact) {
       up(); reg(up);
       grid.append(tile);
     }
-    wrap.append(h("div", { class: "section-title" }, h("h2", { text: group }), h("span", { class: "muted", text: group.startsWith("Moving") ? "Animated by the bulb. Speed applies." : "Steady light for everyday use." })), grid);
+    wrap.append(h("div", { class: "section-title" }, h("h2", { text: group }), h("span", { class: "muted", text: ({ "Dynamic light": "Animated by the bulb. Speed applies.", "White": "Plain white light.", "Functional": "Tuned for an activity.", "Wake-up and bedtime": "Slow fades toward a time of day." })[group] || "" })), grid);
   }
   return wrap;
 }
@@ -781,7 +782,7 @@ function pageMusic(c) {
   const setDefault = h("button", { class: "btn", text: "Set as default", title: "Make these settings what Reset to defaults brings back for this style", onclick: () => api.set_music_default() });
   onUpdate(() => { setDefault.style.display = S.music_changed ? "" : "none"; });
   c.append(h("div", { class: "toolbar", style: { marginTop: 0 } }, h("h2", { text: "Style" }),
-    h("span", { class: "muted", text: "Each style keeps its own settings." }), setDefault,
+    setDefault,
     confirmBtn("Reset to defaults", () => api.reset("music"), "btn ghost danger")));
   const styles = h("div", { class: "styles" });
   for (const m of STATIC.music_modes) {

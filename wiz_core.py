@@ -314,13 +314,15 @@ SCENES = {
     13: "Cool white", 14: "Night light", 15: "Focus", 16: "Relax", 17: "True colors",
     18: "TV time", 19: "Plant growth", 20: "Spring", 21: "Summer", 22: "Fall", 23: "Deep dive",
     24: "Jungle", 25: "Mojito", 26: "Club", 27: "Christmas", 28: "Halloween", 29: "Candlelight",
-    30: "Golden white", 31: "Pulse", 32: "Steampunk",
+    30: "Golden white", 31: "Pulse", 32: "Steampunk", 33: "Diwali", 35: "Alarm",
 }
 SCENE_IDS = {name: sid for sid, name in SCENES.items()}
-# Grouping used on the Scenes page
+# Grouping used on the Scenes page, in the same order as the WiZ app
 SCENE_GROUPS = [
-    ("Moving color", [1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32]),
-    ("Whites and daily", [11, 12, 13, 14, 15, 16, 17, 18, 19, 29, 30, 9, 10]),
+    ("Dynamic light", [5, 22, 26, 3, 2, 4, 8, 20, 21, 7, 24, 25, 1, 23, 27, 33, 28, 29, 31, 30, 32, 35]),
+    ("White", [11, 12, 13]),
+    ("Functional", [14, 6, 17, 16, 15, 18, 19]),
+    ("Wake-up and bedtime", [9, 10]),
 ]
 # Rough two-tone look of each scene, used for the chips and the room picture only
 SCENE_LOOK = {
@@ -340,6 +342,7 @@ SCENE_LOOK = {
     27: ((220, 30, 30), (30, 170, 60)), 28: ((255, 110, 0), (130, 40, 170)),
     29: ((255, 140, 40), (255, 100, 20)), 30: ((255, 200, 110), (255, 215, 140)),
     31: ((255, 60, 60), (60, 60, 255)), 32: ((200, 120, 50), (90, 160, 160)),
+    33: ((255, 170, 40), (230, 60, 150)), 35: ((255, 50, 50), (255, 235, 220)),
 }
 STATIC_SCENES = {11, 12, 13, 14, 15, 16, 17, 18, 19, 29, 30}
 

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WiZard menu</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  html, body { background: var(--panel); overflow: hidden; }
+  body { padding: 6px; }
+  .tm-head { display: flex; align-items: center; gap: 10px; padding: 8px 8px 10px; }
+  .tm-head img { width: 26px; height: 26px; }
+  .tm-title { font: 600 14px var(--font-display); }
+  .tm-status { color: var(--muted); font-size: 12px; }
+  .tm-dots { display: flex; gap: 5px; margin-left: auto; }
+  .tm-sep { height: 1px; background: var(--line-soft); margin: 4px 2px; }
+  .tm-item { width: 100%; height: 34px; display: flex; align-items: center; gap: 10px; padding: 0 10px; border: 0; border-radius: 8px;
+    background: none; color: var(--text); text-align: left; }
+  .tm-item:hover, .tm-item:focus-visible { background: var(--raised); outline: none; }
+  .tm-item svg { color: var(--muted); flex: none; }
+  .tm-item.accent svg, .tm-item.accent { color: var(--accent); }
+  .tm-item.stop, .tm-item.stop svg { color: var(--danger); }
+  .tm-item .hint { margin-left: auto; color: var(--faint); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="tm-head">
+  <img src="logo.svg" alt="">
+  <div><div class="tm-title">WiZard</div><div class="tm-status" id="status">Not syncing</div></div>
+  <div class="tm-dots" id="dots"></div>
+</div>
+<div class="tm-sep"></div>
+<button class="tm-item" id="open"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2.5"/><path d="M3 8h18"/></svg>Open WiZard</button>
+<button class="tm-item accent" id="sync"><svg width="16" height="16" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></svg><span id="syncText">Start sync</span><span class="hint" id="syncHint"></span></button>
+<button class="tm-item" id="off"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 3v8"/><path d="M6.3 6.8a8 8 0 1 0 11.4 0"/></svg>Turn all lights off</button>
+<div class="tm-sep"></div>
+<button class="tm-item" id="exit"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 16l-4-4 4-4M6 12h10"/></svg>Exit</button>
+<script>
+(() => {
+  const ready = new Promise(r => (window.pywebview && window.pywebview.api) ? r() : window.addEventListener("pywebviewready", r, { once: true }));
+  const api = name => ready.then(() => window.pywebview.api[name]());
+  const $ = id => document.getElementById(id);
+  async function refresh() {
+    const s = await api("state");
+    if (!s) return;
+    $("status").textContent = s.syncing ? `${s.kind} sync on` : `${s.on} of ${s.total} lights on`;
+    $("syncText").textContent = s.syncing ? "Stop sync" : "Start sync";
+    $("syncHint").textContent = s.syncing ? "" : s.source;
+    $("sync").className = "tm-item " + (s.syncing ? "stop" : "accent");
+    $("sync").querySelector("svg").innerHTML = s.syncing ? '<rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor"/>' : '<path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/>';
+    const dots = $("dots"); dots.innerHTML = "";
+    for (const c of s.colors) {
+      const d = document.createElement("span"); d.className = "dot";
+      if (c) { d.style.background = `rgb(${c})`; d.style.boxShadow = `0 0 6px rgba(${c},0.6)`; }
+      dots.append(d);
+    }
+  }
+  const act = name => () => api(name).then(() => setTimeout(refresh, 150));
+  $("open").onclick = act("open");
+  $("sync").onclick = act("toggle_sync");
+  $("off").onclick = act("all_off");
+  $("exit").onclick = act("quit");
+  window.addEventListener("focus", refresh);
+  window.addEventListener("blur", () => api("hide"));
+  document.addEventListener("keydown", e => {
+    const items = [...document.querySelectorAll(".tm-item")], i = items.indexOf(document.activeElement);
+    if (e.key === "Escape") api("hide");
+    else if (e.key === "ArrowDown") { items[(i + 1) % items.length].focus(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { items[(i - 1 + items.length) % items.length].focus(); e.preventDefault(); }
+  });
+  window.refresh = refresh;
+  refresh();
+})();
+</script>
+</body>
+</html>

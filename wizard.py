@@ -195,12 +195,59 @@ class Api:
         threading.Thread(target=self._host.quit, daemon=True).start()
 
 
+class TrayApi:
+    """What the themed tray menu (ui/tray.html) can do."""
+
+    def __init__(self, host):
+        self._host = host
+
+    def state(self):
+        ctl = self._host.ctl
+        eng = ctl.engine if ctl.syncing() else None
+        colors = []
+        for ip in sorted(ctl.settings["bulbs"]):
+            rgb = ctl.look(ip)[0]
+            colors.append(",".join(str(int(v)) for v in rgb) if rgb else None)
+        return {"syncing": bool(eng), "kind": eng.kind if eng else None, "source": ctl.settings["sync_source"],
+                "colors": colors[:6], "on": sum(1 for c in colors if c), "total": len(colors)}
+
+    def open(self):
+        self.hide()
+        self._host.show()
+
+    def toggle_sync(self):
+        ctl = self._host.ctl
+        if ctl.syncing():
+            ctl.stop_sync()
+        else:
+            result = ctl.start_sync()
+            if result and not result.get("ok"):
+                self._host.show()
+                ctl.say(result.get("message", ""))
+        self.hide()
+
+    def all_off(self):
+        self._host.ctl.power("all", False)
+        self.hide()
+
+    def quit(self):
+        self.hide()
+        threading.Thread(target=self._host.quit, daemon=True).start()
+
+    def hide(self):
+        menu = self._host.menu_win
+        if menu:
+            threading.Thread(target=menu.hide, daemon=True).start()
+
+
 # ======================================================================= host: window, tray, pushes
 
 class Host:
     def __init__(self, autostart=False):
         self.autostart = autostart
         self.window = None
+        self.menu_win = None          # the themed tray menu, created hidden at startup
+        self._menu_ready = False
         self.tray = None
         self.tray_ok = False
         self.ready = False            # the page has loaded and asked for its first state
@@ -270,6 +317,72 @@ class Host:
         self.window.events.minimized += lambda: self.page_visible(False)
         self.window.events.restored += lambda: self.page_visible(True)
 
+    def create_tray_menu(self):
+        """A small frameless window styled like the app, shown when the tray icon is right-clicked."""
+        import webview
+        try:
+            self.menu_win = webview.create_window(
+                "WiZard menu", url=resource("ui", "tray.html"), js_api=TrayApi(self), width=260, height=226,
+                frameless=True, easy_drag=False, on_top=True, hidden=True, resizable=False,
+                background_color="#131519", text_select=False)
+        except Exception:
+            self.menu_win = None
+
+    def _prepare_menu(self):
+        """Once: keep the menu out of the taskbar, round its corners, hide it when it loses focus."""
+        if self._menu_ready or not IS_WINDOWS:
+            return
+        self._menu_ready = True
+        win = self.menu_win
+
+        def work():
+            try:
+                win.native.ShowInTaskbar = False
+            except Exception:
+                pass
+            try:
+                win.native.Deactivate += lambda sender, args: threading.Thread(target=win.hide, daemon=True).start()
+            except Exception:
+                pass
+        _on_ui_thread(win, work)
+        try:
+            import ctypes
+            pref = ctypes.c_int(2)    # DWMWCP_ROUND
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(win.native.Handle.ToInt32(), 33, ctypes.byref(pref), 4)
+        except Exception:
+            pass
+
+    def show_tray_menu(self):
+        """Open the themed menu just above the mouse. Returns False to fall back to the plain menu."""
+        win = self.menu_win
+        if not (IS_WINDOWS and win and win.native):
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            self._prepare_menu()
+            pt = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(info)
+            user32.GetMonitorInfoW(user32.MonitorFromPoint(pt, 2), ctypes.byref(info))
+            work = info.rcWork
+            w, h = int(win.native.Width), int(win.native.Height)
+            x = max(work.left, min(pt.x, work.right) - w)
+            y = max(work.top, min(pt.y, work.bottom) - h)
+            hwnd = win.native.Handle.ToInt32()
+            user32.SetWindowPos(hwnd, -1, x, y, 0, 0, 0x0001)      # topmost, keep size
+            win.show()
+            user32.SetForegroundWindow(hwnd)
+            return True
+        except Exception:
+            return False
+
     def _on_shown(self):
         dark_title_bar(self.window)
 
@@ -309,6 +422,11 @@ class Host:
             except Exception:
                 pass
         try:
+            if self.menu_win:
+                self.menu_win.destroy()
+        except Exception:
+            pass
+        try:
             self.window.destroy()
         except Exception:
             os._exit(0)
@@ -327,8 +445,24 @@ class Host:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", lambda: threading.Thread(target=self.quit, daemon=True).start()),
         )
+        host = self
+
+        class TrayIcon(pystray.Icon):
+            """Left click opens WiZard; right click opens the menu styled like the app."""
+
+            def _on_notify(self, wparam, lparam):
+                try:
+                    if lparam == 0x0202:                       # WM_LBUTTONUP
+                        host.show()
+                        return
+                    if lparam == 0x0205 and host.show_tray_menu():   # WM_RBUTTONUP
+                        return
+                except Exception:
+                    pass
+                return super()._on_notify(wparam, lparam)
+
         try:
-            self.tray = pystray.Icon("wizard", tray_image(False), APP_NAME, menu)
+            self.tray = TrayIcon("wizard", tray_image(False), APP_NAME, menu)
             self.tray.run_detached()
             self.tray_ok = True
         except Exception:
@@ -455,6 +589,7 @@ def main():
     host = Host(autostart=autostart)
     host.setup_tray()
     host.create_window()
+    host.create_tray_menu()
     listen_for_show(srv, host)
     if host.ctl.settings.get("launch_at_login"):
         try:
