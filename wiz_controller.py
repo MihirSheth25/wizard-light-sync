@@ -69,9 +69,17 @@ class Controller:
         self._state_timer.start()
 
     def set_setting(self, key, value):
-        if key not in W.DEFAULTS or key in ("bulbs", "rooms", "schedules", "screen_presets"):
+        if key not in W.DEFAULTS or key in ("bulbs", "rooms", "schedules", "screen_presets",
+                                            "music_profiles", "music_user_defaults"):
             return False
         with self.lock:
+            if key == "music_mode":
+                # switching style: bring back that style's own settings
+                if value not in W.MUSIC_MODES:
+                    return False
+                self.settings.update(copy.deepcopy(self.settings["music_profiles"].get(value, {})))
+            elif key in W.MUSIC_KEYS:
+                self.settings["music_profiles"].setdefault(self.settings["music_mode"], {})[key] = value
             self.settings[key] = value
         self.save_soon()
         if key == "launch_at_login":
@@ -161,7 +169,8 @@ class Controller:
                            "rgb": list(rgb) if rgb else None, "dim": dim, "words": words or "",
                            "side": W_side(b.get("zone", "Full screen"), len(lights))})
         eng = self.engine if self.syncing() else None
-        settings = {k: v for k, v in s.items() if k not in ("bulbs", "rooms", "schedules")}
+        settings = {k: v for k, v in s.items() if k not in ("bulbs", "rooms", "schedules", "music_profiles",
+                                                            "music_user_defaults")}
         return {
             "settings": settings,
             "lights": lights,
@@ -179,6 +188,7 @@ class Controller:
             "sleep": {k: v for k, v in self.sleep_timers.items()},
             "scene_playing": list(self.current_scene) if self.current_scene else None,
             "preset_changed": self.preset_changed(),
+            "music_changed": self.music_changed(),
             "side_display": self.side_display,
             "status": self.status,
             "discovering": self.discovering,
@@ -710,18 +720,50 @@ class Controller:
         self.changed()
         return True
 
-    def reset_keys(self, which):
-        keys = W.SCREEN_KEYS if which == "screen" else W.MUSIC_KEYS
+    def music_default(self, mode=None):
+        """The settings Reset to defaults brings back for a music style: yours if you set them, else the app's."""
+        mode = mode or self.settings["music_mode"]
+        saved = self.settings["music_user_defaults"].get(mode, {})
+        return {k: copy.deepcopy(saved.get(k, W.DEFAULTS[k])) for k in W.MUSIC_KEYS}
+
+    def music_changed(self):
+        base = self.music_default()
+        for k in W.MUSIC_KEYS:
+            a, b = self.settings[k], base[k]
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
+                if abs(float(a) - float(b)) > 1e-6:
+                    return True
+            elif a != b:
+                return True
+        return False
+
+    def set_music_default(self):
         with self.lock:
-            self.settings.update({k: copy.deepcopy(W.DEFAULTS[k]) for k in keys})
+            mode = self.settings["music_mode"]
+            self.settings["music_user_defaults"][mode] = {k: copy.deepcopy(self.settings[k]) for k in W.MUSIC_KEYS}
+        self.save_soon()
+        self.say(f"Saved as the default for {mode}.")
+        self.changed()
+
+    def reset_keys(self, which):
+        with self.lock:
+            if which == "screen":
+                self.settings.update({k: copy.deepcopy(W.DEFAULTS[k]) for k in W.SCREEN_KEYS})
+            else:
+                values = self.music_default()
+                self.settings.update(values)
+                self.settings["music_profiles"][self.settings["music_mode"]] = copy.deepcopy(values)
         self.save_soon()
         self.changed()
 
     def reset_all(self):
         with self.lock:
-            keep = {k: self.settings[k] for k in ("bulbs", "schedules", "rooms", "screen_presets")}
+            keep = {k: self.settings[k] for k in ("bulbs", "schedules", "rooms", "screen_presets",
+                                                  "music_user_defaults")}
             self.settings = copy.deepcopy(W.DEFAULTS)
             self.settings.update(keep)
+            self.settings["music_profiles"] = {m: self.music_default(m) for m in W.MUSIC_MODES}
+            self.settings.update(self.settings["music_profiles"][self.settings["music_mode"]])
             self.settings["bulbs"] = {ip: {"name": b.get("name", ip), "enabled": True,
                                            "zone": "Full screen", "brightness_scale": 100}
                                       for ip, b in keep["bulbs"].items()}

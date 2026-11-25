@@ -181,6 +181,9 @@ class Api:
     def delete_preset(self, name):
         return self._ctl.delete_preset(name)
 
+    def set_music_default(self):
+        self._ctl.set_music_default()
+
     def reset(self, which):
         if which == "all":
             self._ctl.reset_all()
@@ -398,18 +401,12 @@ def webview_low_memory(window, low):
 
 
 def tray_image(syncing):
-    """A small bulb icon: colorful while syncing, gray when stopped."""
-    from PIL import Image, ImageDraw
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    if syncing:
-        for i, col in enumerate([(255, 60, 60), (255, 170, 0), (60, 200, 90), (60, 120, 255)]):
-            d.pieslice((6, 2, 58, 54), 90 * i - 135, 90 * i - 45, fill=col)
-    else:
-        d.ellipse((6, 2, 58, 54), fill=(120, 128, 140))
-    d.rectangle((22, 50, 42, 62), fill=(200, 200, 205))
-    return img
+    """The wizard hat: in RGB while syncing, plain gray when not."""
+    from PIL import Image
+    try:
+        return Image.open(resource("assets", "tray_on.png" if syncing else "tray_off.png")).convert("RGBA")
+    except OSError:
+        return Image.new("RGBA", (64, 64), (150, 155, 165, 255))
 
 
 # ======================================================================= single instance

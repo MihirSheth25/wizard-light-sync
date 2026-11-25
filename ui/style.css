@@ -38,6 +38,8 @@ h1, h2, h3 { margin: 0; font-family: var(--font-display); font-weight: 600; }
 .app.collapsed { --side: 64px; }
 .side { background: var(--panel); border-right: 1px solid var(--line-soft); display: flex; flex-direction: column; min-width: 0; }
 .brand { height: 56px; display: flex; align-items: center; gap: 10px; padding: 0 12px; }
+.brand-logo { flex: none; display: block; }
+.collapsed .brand-logo { display: none; }
 .brand-name { font: 600 15px var(--font-display); letter-spacing: 0.2px; white-space: nowrap; }
 .collapsed .brand-name, .collapsed .nav-label, .collapsed .now { display: none; }
 

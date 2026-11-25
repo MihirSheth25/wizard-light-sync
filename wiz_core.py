@@ -66,6 +66,8 @@ DEFAULTS = {
     "music_fps": 12,
     "music_smoothing": 0.3,
     "music_split_colors": True,
+    "music_profiles": {},             # music style -> its own copy of every MUSIC_KEYS setting
+    "music_user_defaults": {},        # music style -> the settings saved with Set as default
     "control_brightness": 80,
     "control_kelvin": 3000,
     "control_color": [255, 140, 60],
@@ -83,7 +85,9 @@ SCREEN_KEYS = ("color_mode", "saturation", "smoothing", "fps", "change_threshold
                "min_brightness", "max_brightness", "brightness_gain", "fixed_brightness", "dark_scene",
                "dark_threshold", "ignore_black_bars", "crop_top", "crop_bottom", "crop_left", "crop_right",
                "sample_step")
-MUSIC_KEYS = tuple(k for k in DEFAULTS if k.startswith("music_"))
+# The music settings each style keeps for itself (everything on the Music sync page but the style)
+MUSIC_KEYS = tuple(k for k in DEFAULTS if k.startswith("music_")
+                   and k not in ("music_mode", "music_profiles", "music_user_defaults"))
 
 # The presets the app starts with; each only lists what differs from the defaults
 STARTER_PRESETS = {
@@ -138,6 +142,14 @@ def load_settings():
         data["screen_presets"][name] = {**base, **{k: v for k, v in values.items() if k in SCREEN_KEYS}}
     if data["screen_preset"] not in data["screen_presets"]:
         data["screen_preset"] = next(iter(data["screen_presets"]), "Default")
+    # each music style keeps its own settings; styles seen for the first time start from today's values
+    for mode in MUSIC_MODES:
+        prof = data["music_profiles"].setdefault(mode, {})
+        for k in MUSIC_KEYS:
+            prof.setdefault(k, data[k])
+    if data["music_mode"] not in MUSIC_MODES:
+        data["music_mode"] = DEFAULTS["music_mode"]
+    data.update(data["music_profiles"][data["music_mode"]])
     for i, sc in enumerate(data["schedules"]):    # every schedule needs an id to edit or delete it
         sc.setdefault("id", f"s{i}")
     return data

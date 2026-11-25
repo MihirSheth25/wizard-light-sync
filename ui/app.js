@@ -778,7 +778,11 @@ const MUSIC_INFO = {
 function pageMusic(c) {
   liveHooks = [renderNow];
   if (!STATIC.soundcard) c.append(h("div", { class: "banner", text: "Music sync needs one more package. Run  python -m pip install soundcard  and restart WiZard." }));
-  c.append(h("div", { class: "toolbar", style: { marginTop: 0 } }, h("h2", { text: "Style" }), confirmBtn("Reset to defaults", () => api.reset("music"), "btn ghost danger")));
+  const setDefault = h("button", { class: "btn", text: "Set as default", title: "Make these settings what Reset to defaults brings back for this style", onclick: () => api.set_music_default() });
+  onUpdate(() => { setDefault.style.display = S.music_changed ? "" : "none"; });
+  c.append(h("div", { class: "toolbar", style: { marginTop: 0 } }, h("h2", { text: "Style" }),
+    h("span", { class: "muted", text: "Each style keeps its own settings." }), setDefault,
+    confirmBtn("Reset to defaults", () => api.reset("music"), "btn ghost danger")));
   const styles = h("div", { class: "styles" });
   for (const m of STATIC.music_modes) {
     const [ic, text] = MUSIC_INFO[m] || ["music", ""];
