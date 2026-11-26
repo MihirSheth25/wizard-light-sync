@@ -20,8 +20,11 @@ function h(tag, props, ...kids) {
   for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid.nodeType ? kid : document.createTextNode(kid));
   return el;
 }
+// the bulb mark: two arrows chasing round a circle, with three bars for the base
+const BULB_ARCS = "M10.8 2.71A6.6 6.6 0 0 0 10.8 15.69M9.2 14.2l1.7 1.5-1.6 1.5M13.2 15.69A6.6 6.6 0 0 0 13.2 2.71M14.8 1.2l-1.7 1.5 1.6 1.5";
+const BULB_BARS = "M8 18.7h8M9.4 20.6h5.2M11 22.4h2";
 const ICONS = {
-  lights: '<path d="M10.8 2.71A6.6 6.6 0 0 0 10.8 15.69M9.2 14.2l1.7 1.5-1.6 1.5M13.2 15.69A6.6 6.6 0 0 0 13.2 2.71M14.8 1.2l-1.7 1.5 1.6 1.5M8 18.7h8M9.4 20.6h5.2M11 22.4h2"/>',
+  lights: `<path d="${BULB_ARCS}"/><path d="${BULB_BARS}"/>`,
   rooms: '<path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/><path d="M10 20v-5h4v5"/>',
   scenes: '<rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/>',
   screen: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
@@ -109,6 +112,7 @@ let stageCanvases = new Set();
 let pendingPreset = false;
 let sink = null;          // when set, new controls register their refresh here (used by dialogs)
 let drawerBuilding = false;
+let drawerRename = null;   // starts renaming the light or room open in the drawer
 let pendingOpen = null;   // a tile click waits a moment, so a double-click can rename instead
 const reg = f => (sink || (drawerBuilding ? drawerUpdaters : updaters)).push(f);
 const PAGES = [
@@ -378,20 +382,46 @@ function paintOrb(el, l) {
   } else { el.style.background = ""; el.style.opacity = ""; }
 }
 
-// rename in place: double-click the name
+// a light shown as the bulb mark: only the arrows take the light's color and glow
+function bulbGlyph(l, size = 40) {
+  const el = h("span", { class: "bulb", style: { width: size + "px", height: size + "px" } });
+  el.innerHTML = `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path class="arcs" d="${BULB_ARCS}" stroke-width="1.6"/><path class="bars" d="${BULB_BARS}" stroke-width="1.6"/></svg>`;
+  paintBulb(el, l);
+  return el;
+}
+function paintBulb(el, l) {
+  const arcs = el.querySelector(".arcs"), lit = l && l.rgb;
+  if (lit) {
+    const a = 0.5 + 0.5 * (l.dim / 100);
+    arcs.setAttribute("stroke", rgbCss(l.rgb));
+    el.style.filter = `drop-shadow(0 0 ${2 + 4 * a}px ${rgbCss(l.rgb, 0.85 * a)}) drop-shadow(0 0 ${6 + 8 * a}px ${rgbCss(l.rgb, 0.45 * a)})`;
+  } else { arcs.setAttribute("stroke", "#4a4f59"); el.style.filter = ""; }
+  el.querySelector(".bars").setAttribute("stroke", lit ? "#aeb3bd" : "#4a4f59");
+}
+
+// rename in place: double-click the name or click the pencil
 function nameCell(text, save, cls = "tile-name") {
   const el = h("div", { class: cls, text, title: "Double-click to rename" });
-  el.addEventListener("dblclick", e => {
-    e.stopPropagation(); clearTimeout(pendingOpen); pendingOpen = null;
+  const pencil = h("button", { class: "rename", title: "Rename", "aria-label": "Rename" }, icon("edit", 14));
+  const wrap = h("div", { class: "name-row" }, el, pencil);
+  const start = e => {
+    if (e) { e.stopPropagation(); e.preventDefault(); }
+    clearTimeout(pendingOpen); pendingOpen = null;
+    if (!el.isConnected) return;
     const input = h("input", { class: "inline-edit", value: el.textContent, maxlength: 40 });
-    el.replaceWith(input); input.focus(); input.select();
+    el.replaceWith(input); pencil.style.display = "none"; input.focus(); input.select();
     let done = false;
-    const finish = keep => { if (done) return; done = true; const v = input.value.trim(); input.replaceWith(el); if (keep && v && v !== el.textContent) { el.textContent = v; save(v); } };
+    const finish = keep => { if (done) return; done = true; const v = input.value.trim(); input.replaceWith(el); pencil.style.display = "";
+      if (keep && v && v !== el.textContent) { el.textContent = v; save(v); } };
     input.addEventListener("keydown", ev => { ev.stopPropagation(); if (ev.key === "Enter") finish(true); if (ev.key === "Escape") finish(false); });
     input.addEventListener("blur", () => finish(true));
     input.addEventListener("click", ev => ev.stopPropagation());
-  });
-  return el;
+  };
+  el.addEventListener("dblclick", start);
+  pencil.addEventListener("click", start);
+  wrap.startRename = start;
+  return wrap;
 }
 
 function toast(text) {
@@ -493,21 +523,27 @@ function drawStage(cv) {
   round(sx - 46 * sc, my + mh + 22 * sc, 92 * sc, desk - (my + mh + 22 * sc), 3 * sc); g.fill();
   // bulbs and their names
   const small = sc < 0.7;
+  const arcs = new Path2D(BULB_ARCS), bars = new Path2D(BULB_BARS);
   for (const b of bulbs) {
-    const r = 18 * sc;
+    const k = 2.3 * sc;                      // the 24-unit mark drawn about 55 px tall
+    g.save(); g.translate(b.x - 12 * k, b.y - 12 * k); g.scale(k, k);
+    g.lineCap = "round"; g.lineJoin = "round"; g.lineWidth = 1.6;
     if (b.l.rgb) {
-      g.fillStyle = rgbCss(b.l.rgb); g.beginPath(); g.arc(b.x, b.y, r, 0, Math.PI * 2); g.fill();
-      g.fillStyle = rgbCss(b.l.rgb.map(v => Math.round(v + (255 - v) * 0.4))); g.beginPath(); g.arc(b.x, b.y - 3 * sc, r * 0.55, 0, Math.PI * 2); g.fill();
+      const a = 0.5 + 0.5 * (b.l.dim / 100);
+      g.strokeStyle = rgbCss(b.l.rgb);
+      g.shadowColor = rgbCss(b.l.rgb, 0.9 * a); g.shadowBlur = 14 * sc * a; g.stroke(arcs);
+      g.shadowBlur = 5 * sc; g.stroke(arcs);
+      g.shadowBlur = 0; g.strokeStyle = "#aeb3bd";
     } else {
-      g.fillStyle = "#23262d"; g.beginPath(); g.arc(b.x, b.y, r, 0, Math.PI * 2); g.fill(); g.strokeStyle = "#353943"; g.stroke();
+      g.strokeStyle = "#4a4f59"; g.stroke(arcs);
     }
-    g.strokeStyle = b.l.rgb ? "#c9ccd3" : "#4a4f59"; g.lineCap = "round"; g.lineWidth = Math.max(1.5, 2.4 * sc);
-    [[9, 5], [6, 9.5], [3, 14]].forEach(([half, dy]) => { g.beginPath(); g.moveTo(b.x - half * sc, b.y + r + dy * sc); g.lineTo(b.x + half * sc, b.y + r + dy * sc); g.stroke(); });
+    g.stroke(bars);
+    g.restore();
     if (small) continue;
     g.textAlign = "center"; g.fillStyle = "#e9ebef"; g.font = `600 ${Math.max(11, 13 * sc)}px "Segoe UI Variable Text","Segoe UI",system-ui`;
-    g.fillText(b.l.name, b.x, b.y + r + 30 * sc);
+    g.fillText(b.l.name, b.x, b.y + 46 * sc);
     g.fillStyle = "#8b919c"; g.font = `${Math.max(10, 11.5 * sc)}px "Segoe UI Variable Text","Segoe UI",system-ui`;
-    g.fillText(b.l.rgb ? lookText(b.l) : "Off", b.x, b.y + r + 48 * sc);
+    g.fillText(b.l.rgb ? lookText(b.l) : "Off", b.x, b.y + 64 * sc);
   }
 }
 
@@ -516,14 +552,10 @@ function paintArt(g, art, x, y, w, hgt, sc, small) {
   const font = (size, weight = 600) => `${weight} ${Math.max(10, size * sc)}px "Segoe UI Variable Display","Segoe UI",system-ui`;
   g.textAlign = "center";
   if (art.kind === "screen") {
-    const sw = 58 * sc, sh = 36 * sc, cy = y + hgt * 0.38;
-    g.strokeStyle = rgbCss(accent); g.lineWidth = Math.max(2, 3 * sc); g.beginPath(); g.roundRect(cx - sw / 2, cy - sh / 2, sw, sh, 6 * sc); g.stroke();
-    const t = 9 * sc; g.fillStyle = rgbCss(accent); g.beginPath(); g.moveTo(cx - t * 0.7, cy - t); g.lineTo(cx - t * 0.7, cy + t); g.lineTo(cx + t, cy); g.closePath(); g.fill();
-    for (const s of [-1, 1]) {
-      const ex = cx + s * (sw / 2 + 9 * sc);
-      for (const dy of [-1, 0, 1]) { g.beginPath(); g.moveTo(ex, cy + dy * 9 * sc); g.lineTo(ex + s * 13 * sc, cy + dy * 15 * sc); g.stroke(); }
-    }
-    if (!small) { g.fillStyle = "#e9ebef"; g.font = font(15); g.fillText("Screen sync", cx, y + hgt * 0.78); }
+    // a play triangle with softly rounded corners
+    const t = 22 * sc, cy = y + hgt / 2, x0 = cx - t * 0.62, x1 = cx + t * 0.9;
+    g.fillStyle = rgbCss(accent); g.strokeStyle = rgbCss(accent); g.lineJoin = "round"; g.lineWidth = 6 * sc;
+    g.beginPath(); g.moveTo(x0, cy - t); g.lineTo(x0, cy + t); g.lineTo(x1, cy); g.closePath(); g.fill(); g.stroke();
   } else if (art.kind === "music") {
     const lv = [0.35, 0.6, 0.85, 0.55, 0.72, 0.95, 0.62, 0.42, 0.78, 0.5, 0.3, 0.66, 0.45, 0.25];
     const pad = 16 * sc, gap = Math.max(2, 4 * sc), bw = (w - 2 * pad - gap * (lv.length - 1)) / lv.length, base = y + hgt - 14 * sc;
@@ -553,7 +585,7 @@ function paintArt(g, art, x, y, w, hgt, sc, small) {
 // ------------------------------------------------------------------ Lights page
 function lightTile(l) {
   const ip = l.ip;
-  const o = orb(l);
+  const o = bulbGlyph(l, 40);
   const sub = h("div", { class: "tile-sub" });
   const value = h("span", { class: "num" });
   const send = throttle(v => api.set_brightness(`light:${ip}`, v, false), 70);
@@ -565,7 +597,7 @@ function lightTile(l) {
     h("div", { class: "tile-foot" }, icon("lights", 16), sl, value));
   const up = () => {
     const cur = lightByIp(ip); if (!cur) return;
-    paintOrb(o, cur);
+    paintBulb(o, cur);
     const room = cur.room ? roomById(cur.room)?.name : null;
     sub.textContent = (room ? room + "  ·  " : "") + lookText(cur);
     if (!sl.matches(":active")) value.textContent = (cur.rgb ? cur.dim : 0) + "%";
@@ -762,9 +794,8 @@ function pageScreen(c) {
 }
 
 function orbLive(ip) {
-  const o = orb(lightByIp(ip), "orb");
-  o.style.width = o.style.height = "26px";
-  const up = () => paintOrb(o, lightByIp(ip)); liveHooks.push(up); updaters.push(up);
+  const o = bulbGlyph(lightByIp(ip), 28);
+  const up = () => paintBulb(o, lightByIp(ip)); liveHooks.push(up); updaters.push(up);
   return o;
 }
 
@@ -962,12 +993,14 @@ function renderDrawer() {
   const sub = h("div", { class: "tile-sub" });
   if (isRoom) {
     const r = roomById(key.slice(5));
-    head.append(h("div", { class: "d-title" }, nameCell(r.name, v => api.rename_room(r.id, v)), sub));
+    const nm = nameCell(r.name, v => api.rename_room(r.id, v)); drawerRename = nm.startRename;
+    head.append(h("div", { class: "d-title" }, nm, sub));
     drawerUpdaters.push(() => { const ls = keyIps(key).map(lightByIp).filter(Boolean); sub.textContent = `${ls.length} ${ls.length === 1 ? "light" : "lights"}  ·  ${ls.filter(isOn).length} on`; });
   } else {
-    const l = lightByIp(ip), o = orb(l);
-    head.append(o, h("div", { class: "d-title" }, nameCell(l.name, v => api.set_light(ip, "name", v)), sub));
-    drawerUpdaters.push(() => { const cur = lightByIp(ip); if (cur) { paintOrb(o, cur); sub.textContent = lookText(cur); } });
+    const l = lightByIp(ip), o = bulbGlyph(l, 44);
+    const nm = nameCell(l.name, v => api.set_light(ip, "name", v)); drawerRename = nm.startRename;
+    head.append(o, h("div", { class: "d-title" }, nm, sub));
+    drawerUpdaters.push(() => { const cur = lightByIp(ip); if (cur) { paintBulb(o, cur); sub.textContent = lookText(cur); } });
   }
   head.append(h("button", { class: "icon-btn", title: "Close", onclick: closeDrawer }, icon("close", 18)));
   const tabs = ["Control", "Scenes", "Schedules", isRoom ? "Lights" : "Settings"];
@@ -1077,6 +1110,7 @@ function drawerLightSettings(body, key) {
       h("div", { class: "field", style: { gridTemplateColumns: "130px 1fr 50px" } }, h("label", { text: "Brightness limit" }), scale, scaleVal),
       h("div", { class: "field two", style: { gridTemplateColumns: "1fr auto" } }, h("label", { text: "Include in screen and music sync" }), toggle(() => lightByIp(ip)?.enabled, v => api.set_light(ip, "enabled", v))))),
     card("This light", `IP address ${l.ip}`, h("div", { class: "row" },
+      h("button", { class: "btn", text: "Rename", onclick: () => drawerRename && drawerRename() }),
       h("button", { class: "btn", text: "Identify", title: "Flashes the light soft yellow", onclick: () => api.identify(ip) }),
       confirmBtn("Remove light", () => { closeDrawer(); api.remove_light(ip); })))));
 }
@@ -1090,7 +1124,8 @@ function drawerRoomLights(body, key) {
     return h("label", { class: "check" }, cb, orb(l, "orb sm"), h("span", { text: l.name }), h("span", { class: "spacer" }), other ? h("span", { class: "faint", text: `In ${other}` }) : null);
   }));
   body.append(card("Lights in this room", "A light can be in one room. Checking a light here moves it from its other room.", list));
-  body.append(h("div", { style: { marginTop: "14px" } }, confirmBtn("Delete room", () => { closeDrawer(); api.delete_room(rid); })));
+  body.append(h("div", { class: "row", style: { marginTop: "14px" } }, h("button", { class: "btn", text: "Rename room", onclick: () => drawerRename && drawerRename() }),
+    confirmBtn("Delete room", () => { closeDrawer(); api.delete_room(rid); })));
 }
 
 // ------------------------------------------------------------------ start

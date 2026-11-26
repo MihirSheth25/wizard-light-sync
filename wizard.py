@@ -337,6 +337,11 @@ class Host:
 
         def work():
             try:
+                from System.Windows.Forms import FormStartPosition
+                win.native.StartPosition = FormStartPosition.Manual
+            except Exception:
+                pass
+            try:
                 win.native.ShowInTaskbar = False
             except Exception:
                 pass
@@ -353,7 +358,10 @@ class Host:
             pass
 
     def show_tray_menu(self):
-        """Open the themed menu just above the mouse. Returns False to fall back to the plain menu."""
+        """
+        Open the themed menu next to the mouse, on the side away from the taskbar, wherever the taskbar
+        is (bottom, top, left, right, or set to hide itself). Returns False to fall back to the plain menu.
+        """
         win = self.menu_win
         if not (IS_WINDOWS and win and win.native):
             return False
@@ -371,20 +379,34 @@ class Host:
             info = MONITORINFO()
             info.cbSize = ctypes.sizeof(info)
             user32.GetMonitorInfoW(user32.MonitorFromPoint(pt, 2), ctypes.byref(info))
-            work = info.rcWork
-            w, h = int(win.native.Width), int(win.native.Height)
-            x = max(work.left, min(pt.x, work.right) - w)
-            y = max(work.top, min(pt.y, work.bottom) - h)
+            mon, work = info.rcMonitor, info.rcWork
             hwnd = win.native.Handle.ToInt32()
-            user32.SetWindowPos(hwnd, -1, x, y, 0, 0, 0x0001)      # topmost, keep size
-            win.show()
-            user32.SetForegroundWindow(hwnd)
+            rect = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            w, h = rect.right - rect.left, rect.bottom - rect.top
+            # open toward the middle of the screen, away from the taskbar
+            x = pt.x - w if pt.x > (mon.left + mon.right) // 2 else pt.x
+            y = pt.y - h if pt.y > (mon.top + mon.bottom) // 2 else pt.y
+            # keep it on screen and off a taskbar that is showing; an auto-hidden taskbar leaves the work
+            # area the whole monitor, so the mouse position itself keeps the menu clear of it
+            x = max(work.left, min(x, work.right - w))
+            y = max(work.top, min(y, work.bottom - h))
+
+            def place():
+                user32.SetWindowPos(hwnd, -1, x, y, 0, 0, 0x0001 | 0x0040)   # topmost, keep size, show
+                user32.SetForegroundWindow(hwnd)
+
+            place()
+            win.show()          # Windows may move a form the first time it is shown, so place it again after
+            place()
+            threading.Timer(0.05, place).start()
             return True
         except Exception:
             return False
 
     def _on_shown(self):
         dark_title_bar(self.window)
+        set_window_icons(self.window)
 
     def _on_closing(self):
         if self.ctl.quitting:
@@ -500,6 +522,28 @@ def dark_title_bar(window):
         for attr in (20, 19):   # DWMWA_USE_IMMERSIVE_DARK_MODE, and its older number
             if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), 4) == 0:
                 break
+    except Exception:
+        pass
+
+
+def set_window_icons(window):
+    """Give the window crisp small and large icons from wiz.ico, so the taskbar shows the wizard hat."""
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_uint]
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+        hwnd = window.native.Handle.ToInt64()
+        path = resource("wiz.ico")
+        for which, metric in ((1, 11), (0, 49)):      # ICON_BIG with SM_CXICON, ICON_SMALL with SM_CXSMICON
+            size = user32.GetSystemMetrics(metric)
+            hicon = user32.LoadImageW(None, path, 1, size, size, 0x0010)   # IMAGE_ICON, LR_LOADFROMFILE
+            if hicon:
+                user32.SendMessageW(hwnd, 0x0080, which, hicon)            # WM_SETICON
     except Exception:
         pass
 

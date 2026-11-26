@@ -87,6 +87,8 @@ class Controller:
                 W.set_launch_at_login(bool(value))
             except OSError as exc:
                 self.say(f"Could not change the login setting: {exc}")
+        if key == "sync_source" and self.syncing() and self.engine.kind != value:
+            self._switch_engine()
         if key in ("scene_speed", "scene_brightness") and self.current_scene and not self.syncing():
             self._send_scene(*self.current_scene, throttle=True)
         self.changed()
@@ -570,6 +572,22 @@ class Controller:
         self.emit("sync", True)
         self.changed()
         return {"ok": True}
+
+    def _switch_engine(self):
+        """Switching between screen and music while syncing: hand over to the other engine at once.
+        The new engine keeps the light states saved before sync began, so stopping still restores them."""
+        old = self.engine
+        saved = dict(old.saved_states)
+        old.saved_states = {}
+        old.stop()
+        old.join(timeout=3)
+        cls = W.MusicEngine if self.settings["sync_source"] == "Music" else W.ScreenEngine
+        self.engine = cls(self.get_settings)
+        self.engine.saved_states = saved
+        self.engine.start()
+        threading.Thread(target=self._watch_engine, args=(self.engine,), daemon=True).start()
+        self.status = f"{self.settings['sync_source']} sync on"
+        self.emit("sync", True)
 
     def stop_sync(self, restore=True):
         eng = self.engine

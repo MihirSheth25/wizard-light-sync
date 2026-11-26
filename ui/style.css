@@ -186,6 +186,13 @@ input[type=range].kelvin::-webkit-slider-thumb { margin-top: -4px; }
 .orb-stack .orb { width: 22px; height: 22px; margin-left: -6px; border: 2px solid var(--card); }
 .orb-stack .orb:first-child { margin-left: 0; }
 
+.bulb { display: inline-grid; place-items: center; flex: none; transition: filter 120ms linear; }
+.bulb svg { display: block; }
+.name-row { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.name-row .tile-name { min-width: 0; }
+.rename { width: 24px; height: 24px; flex: none; display: inline-grid; place-items: center; border: 0; border-radius: 6px; background: none; color: var(--muted); opacity: 0; transition: opacity 100ms; }
+.rename:hover { background: var(--raised); color: var(--text); }
+.tile:hover .rename, .d-head .rename, .rename:focus-visible { opacity: 1; }
 .inline-edit { background: var(--raised); border: 1px solid var(--accent); border-radius: 6px; padding: 2px 6px; font-weight: 600;
   font-size: 14px; width: 100%; outline: none; user-select: text; }
 
