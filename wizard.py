@@ -48,6 +48,16 @@ def set_below_normal_priority():
             pass
 
 
+def set_app_id():
+    """Give WiZard its own taskbar identity, so the taskbar shows the wizard hat instead of Python's icon."""
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(ctypes.c_wchar_p("MihirSheth.WiZard"))
+        except Exception:
+            pass
+
+
 def set_efficiency_mode(on):
     """Windows 11 efficiency mode (EcoQoS). On while idle in the tray, off while syncing."""
     if not IS_WINDOWS:
@@ -675,6 +685,7 @@ def main():
     except ImportError:
         sys.exit("WiZard needs pywebview. Run:  python -m pip install -r requirements.txt")
     set_below_normal_priority()
+    set_app_id()
     autostart = "--autostart" in sys.argv
     host = Host(autostart=autostart)
     host.setup_tray()

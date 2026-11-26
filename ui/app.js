@@ -22,7 +22,8 @@ function h(tag, props, ...kids) {
 }
 // the bulb mark: two arrows chasing round a circle, with three bars for the base
 // each arrow has half an arrowhead, a single barb pointing into the circle
-const BULB_ARCS = "M10.8 2.71A6.6 6.6 0 0 0 10.8 15.69M8.9 12.63L10.8 15.69M13.2 15.69A6.6 6.6 0 0 0 13.2 2.71M13.2 2.71L15.6 5.36";
+// the two halves are exact 180-degree turns of each other around the circle's center (12, 9.2)
+const BULB_ARCS = "M10.8 2.71A6.6 6.6 0 0 0 10.8 15.69M9.22 13.39L10.8 15.69M13.2 15.69A6.6 6.6 0 0 0 13.2 2.71M13.2 2.71L14.78 5.01";
 const BULB_BARS = "M8 18.7h8M9.4 20.6h5.2M11 22.4h2";
 const ICONS = {
   lights: `<path d="${BULB_ARCS}" stroke-width="1.36"/><path d="${BULB_BARS}"/>`,
