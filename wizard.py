@@ -20,6 +20,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 
 import wiz_core as W
 from wiz_controller import Controller
@@ -235,9 +236,7 @@ class TrayApi:
         threading.Thread(target=self._host.quit, daemon=True).start()
 
     def hide(self):
-        menu = self._host.menu_win
-        if menu:
-            threading.Thread(target=menu.hide, daemon=True).start()
+        self._host.hide_tray_menu()
 
 
 # ======================================================================= host: window, tray, pushes
@@ -248,6 +247,8 @@ class Host:
         self.window = None
         self.menu_win = None          # the themed tray menu, created hidden at startup
         self._menu_ready = False
+        self._menu_hidden_at = 0.0    # when the menu last closed, so a click on the icon can toggle it
+        self._last_double = 0.0
         self.tray = None
         self.tray_ok = False
         self.ready = False            # the page has loaded and asked for its first state
@@ -347,7 +348,7 @@ class Host:
             except Exception:
                 pass
             try:
-                win.native.Deactivate += lambda sender, args: threading.Thread(target=win.hide, daemon=True).start()
+                win.native.Deactivate += lambda sender, args: self.hide_tray_menu()
             except Exception:
                 pass
         _on_ui_thread(win, work)
@@ -357,6 +358,27 @@ class Host:
             ctypes.windll.dwmapi.DwmSetWindowAttribute(win.native.Handle.ToInt32(), 33, ctypes.byref(pref), 4)
         except Exception:
             pass
+
+    def hide_tray_menu(self):
+        win = self.menu_win
+        if win:
+            self._menu_hidden_at = time.time()
+            threading.Thread(target=win.hide, daemon=True).start()
+
+    def tray_click(self, kind):
+        """One click (left or right) opens the tray menu; a double-click opens WiZard."""
+        now = time.time()
+        if kind == "double":
+            self._last_double = now
+            self.hide_tray_menu()
+            self.show()
+            return
+        if now - self._last_double < 0.7:      # the button release that ends a double-click
+            return
+        if now - self._menu_hidden_at < 0.3:   # the click that just closed the menu: leave it closed
+            return
+        if not self.show_tray_menu():
+            raise RuntimeError("themed menu unavailable")
 
     MENU_SIZE = (260, 226)     # in screen points; multiplied by the display scale
 
@@ -490,17 +512,21 @@ class Host:
         host = self
 
         class TrayIcon(pystray.Icon):
-            """Left click opens WiZard; right click opens the menu styled like the app."""
+            """A click opens the menu styled like the app; a double-click opens WiZard."""
 
             def _on_notify(self, wparam, lparam):
                 try:
-                    if lparam == 0x0202:                       # WM_LBUTTONUP
-                        host.show()
+                    if lparam == 0x0203:                       # WM_LBUTTONDBLCLK
+                        host.tray_click("double")
                         return
-                    if lparam == 0x0205 and host.show_tray_menu():   # WM_RBUTTONUP
+                    if lparam in (0x0202, 0x0205):             # WM_LBUTTONUP, WM_RBUTTONUP
+                        host.tray_click("single")
                         return
                 except Exception:
                     pass
+                if lparam == 0x0202:
+                    host.show()
+                    return
                 return super()._on_notify(wparam, lparam)
 
         try:

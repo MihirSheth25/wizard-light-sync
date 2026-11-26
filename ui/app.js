@@ -25,7 +25,7 @@ function h(tag, props, ...kids) {
 const BULB_ARCS = "M10.8 2.71A6.6 6.6 0 0 0 10.8 15.69M8.9 12.63L10.8 15.69M13.2 15.69A6.6 6.6 0 0 0 13.2 2.71M13.2 2.71L15.6 5.36";
 const BULB_BARS = "M8 18.7h8M9.4 20.6h5.2M11 22.4h2";
 const ICONS = {
-  lights: `<path d="${BULB_ARCS}"/><path d="${BULB_BARS}"/>`,
+  lights: `<path d="${BULB_ARCS}" stroke-width="1.36"/><path d="${BULB_BARS}"/>`,
   rooms: '<path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/><path d="M10 20v-5h4v5"/>',
   scenes: '<rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/>',
   screen: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
@@ -388,7 +388,7 @@ function paintOrb(el, l) {
 function bulbGlyph(l, size = 40) {
   const el = h("span", { class: "bulb", style: { width: size + "px", height: size + "px" } });
   el.innerHTML = `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path class="arcs" d="${BULB_ARCS}" stroke-width="1.6"/><path class="bars" d="${BULB_BARS}" stroke-width="1.6"/></svg>`;
+    <path class="arcs" d="${BULB_ARCS}" stroke-width="1.28"/><path class="bars" d="${BULB_BARS}" stroke-width="1.6"/></svg>`;
   paintBulb(el, l);
   return el;
 }
@@ -397,7 +397,7 @@ function paintBulb(el, l) {
   if (lit) {
     const a = 0.5 + 0.5 * (l.dim / 100);
     arcs.setAttribute("stroke", rgbCss(l.rgb));
-    el.style.filter = `drop-shadow(0 0 ${2 + 4 * a}px ${rgbCss(l.rgb, 0.85 * a)}) drop-shadow(0 0 ${6 + 8 * a}px ${rgbCss(l.rgb, 0.45 * a)})`;
+    el.style.filter = `drop-shadow(0 0 ${1.5 + 2.5 * a}px ${rgbCss(l.rgb, 0.7 * a)}) drop-shadow(0 0 ${5 + 6 * a}px ${rgbCss(l.rgb, 0.4 * a)})`;
   } else { arcs.setAttribute("stroke", "#4a4f59"); el.style.filter = ""; }
   el.querySelector(".bars").setAttribute("stroke", lit ? "#aeb3bd" : "#4a4f59");
 }
@@ -529,17 +529,17 @@ function drawStage(cv) {
   for (const b of bulbs) {
     const k = 2.3 * sc;                      // the 24-unit mark drawn about 55 px tall
     g.save(); g.translate(b.x - 12 * k, b.y - 12 * k); g.scale(k, k);
-    g.lineCap = "round"; g.lineJoin = "round"; g.lineWidth = 1.6;
+    g.lineCap = "round"; g.lineJoin = "round"; g.lineWidth = 1.28;
     if (b.l.rgb) {
       const a = 0.5 + 0.5 * (b.l.dim / 100);
       g.strokeStyle = rgbCss(b.l.rgb);
-      g.shadowColor = rgbCss(b.l.rgb, 0.9 * a); g.shadowBlur = 14 * sc * a; g.stroke(arcs);
-      g.shadowBlur = 5 * sc; g.stroke(arcs);
-      g.shadowBlur = 0; g.strokeStyle = "#aeb3bd";
+      g.shadowColor = rgbCss(b.l.rgb, 0.8 * a); g.shadowBlur = 12 * sc * a; g.stroke(arcs);
+      g.shadowBlur = 0; g.stroke(arcs);            // a crisp pass on top keeps the arrowheads readable
+      g.strokeStyle = "#aeb3bd";
     } else {
       g.strokeStyle = "#4a4f59"; g.stroke(arcs);
     }
-    g.stroke(bars);
+    g.lineWidth = 1.6; g.stroke(bars);
     g.restore();
     if (small) continue;
     g.textAlign = "center"; g.fillStyle = "#e9ebef"; g.font = `600 ${Math.max(11, 13 * sc)}px "Segoe UI Variable Text","Segoe UI",system-ui`;
@@ -595,8 +595,8 @@ function lightTile(l) {
     onInput: v => { value.textContent = v + "%"; send(v); }, onChange: v => api.set_brightness(`light:${ip}`, v, true) });
   const name = nameCell(l.name, v => api.set_light(ip, "name", v));
   const actions = h("div", { class: "tile-actions" },
-    h("button", { class: "btn sm", title: "Rename this light", onclick: e => name.startRename(e) }, icon("edit", 14), h("span", { text: "Rename" })),
-    h("button", { class: "btn sm", title: "Flash this light warm white once", onclick: e => { e.stopPropagation(); api.identify(ip); } }, icon("identify", 14), h("span", { text: "Identify" })));
+    h("button", { class: "square-btn", title: "Rename this light", "aria-label": "Rename", onclick: e => name.startRename(e) }, icon("edit", 16)),
+    h("button", { class: "square-btn", title: "Identify: flash this light warm white once", "aria-label": "Identify", onclick: e => { e.stopPropagation(); api.identify(ip); } }, icon("identify", 16)));
   const tile = h("div", { class: "tile light", onclick: () => openSoon(`light:${ip}`) },
     h("div", { class: "tile-main" },
       h("div", { class: "tile-head" }, o, h("div", { class: "tile-body" }, name, sub),
