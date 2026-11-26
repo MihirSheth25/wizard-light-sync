@@ -21,7 +21,8 @@ function h(tag, props, ...kids) {
   return el;
 }
 // the bulb mark: two arrows chasing round a circle, with three bars for the base
-const BULB_ARCS = "M10.8 2.71A6.6 6.6 0 0 0 10.8 15.69M9.2 14.2l1.7 1.5-1.6 1.5M13.2 15.69A6.6 6.6 0 0 0 13.2 2.71M14.8 1.2l-1.7 1.5 1.6 1.5";
+// each arrow has half an arrowhead, a single barb pointing into the circle
+const BULB_ARCS = "M10.8 2.71A6.6 6.6 0 0 0 10.8 15.69M8.9 12.63L10.8 15.69M13.2 15.69A6.6 6.6 0 0 0 13.2 2.71M13.2 2.71L15.6 5.36";
 const BULB_BARS = "M8 18.7h8M9.4 20.6h5.2M11 22.4h2";
 const ICONS = {
   lights: `<path d="${BULB_ARCS}"/><path d="${BULB_BARS}"/>`,
@@ -36,6 +37,7 @@ const ICONS = {
   close: '<path d="M6 6l12 12M18 6L6 18"/>',
   play: '<path d="M8 5.5v13l10.5-6.5z" fill="currentColor" stroke="none"/>',
   edit: '<path d="M4 20h4L19.5 8.5l-4-4L4 16z"/>',
+  identify: '<circle cx="12" cy="12" r="3.2"/><path d="M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.6 5.6l1.6 1.6M16.8 16.8l1.6 1.6M5.6 18.4l1.6-1.6M16.8 7.2l1.6-1.6"/>',
   trash: '<path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   refresh: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v5h-5"/>',
@@ -591,10 +593,16 @@ function lightTile(l) {
   const send = throttle(v => api.set_brightness(`light:${ip}`, v, false), 70);
   const sl = slider({ min: 10, max: 100, label: `${l.name} brightness`, get: () => lightByIp(ip)?.dim || null,
     onInput: v => { value.textContent = v + "%"; send(v); }, onChange: v => api.set_brightness(`light:${ip}`, v, true) });
-  const tile = h("div", { class: "tile", onclick: () => openSoon(`light:${ip}`) },
-    h("div", { class: "tile-head" }, o, h("div", { class: "tile-body" }, nameCell(l.name, v => api.set_light(ip, "name", v)), sub),
-      toggle(() => isOn(lightByIp(ip)), on => api.power(`light:${ip}`, on), `${l.name} power`)),
-    h("div", { class: "tile-foot" }, icon("lights", 16), sl, value));
+  const name = nameCell(l.name, v => api.set_light(ip, "name", v));
+  const actions = h("div", { class: "tile-actions" },
+    h("button", { class: "btn sm", title: "Rename this light", onclick: e => name.startRename(e) }, icon("edit", 14), h("span", { text: "Rename" })),
+    h("button", { class: "btn sm", title: "Flash this light warm white once", onclick: e => { e.stopPropagation(); api.identify(ip); } }, icon("identify", 14), h("span", { text: "Identify" })));
+  const tile = h("div", { class: "tile light", onclick: () => openSoon(`light:${ip}`) },
+    h("div", { class: "tile-main" },
+      h("div", { class: "tile-head" }, o, h("div", { class: "tile-body" }, name, sub),
+        toggle(() => isOn(lightByIp(ip)), on => api.power(`light:${ip}`, on), `${l.name} power`)),
+      h("div", { class: "tile-foot" }, icon("lights", 16), sl, value)),
+    actions);
   const up = () => {
     const cur = lightByIp(ip); if (!cur) return;
     paintBulb(o, cur);
@@ -620,7 +628,7 @@ function pageLights(c) {
     c.append(h("div", { class: "empty" }, h("p", { text: "No lights yet. Click Find lights to search your Wi-Fi, or add one by its IP address." })));
     return;
   }
-  const grid = h("div", { class: "grid" });
+  const grid = h("div", { class: "grid lights" });
   S.lights.forEach(l => grid.append(lightTile(l)));
   c.append(grid);
 }

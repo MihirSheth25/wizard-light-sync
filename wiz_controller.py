@@ -311,7 +311,7 @@ class Controller:
         self.current_scene = (sid, key)
 
     def identify(self, ip):
-        """Flash the light soft yellow at 50% once. Works while syncing too."""
+        """Flash the light warm white at 50% once. Works while syncing too."""
         engine = self.engine if self.syncing() else None
         flash_for = 0.7
         if engine:
@@ -321,7 +321,7 @@ class Controller:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(0.5)
             state = None if engine else W.bulb_get_state(sock, ip)
-            W.bulb_send(sock, ip, W.color_cmd((255, 200, 80), 50)[0])
+            W.bulb_send(sock, ip, W.white_cmd(2700, 50)[0])
             time.sleep(flash_for)
             if engine:
                 engine.hold_until.pop(ip, None)
@@ -332,7 +332,7 @@ class Controller:
             sock.close()
 
         threading.Thread(target=work, daemon=True).start()
-        self.say(f"{self.light_name(ip)} flashed soft yellow")
+        self.say(f"{self.light_name(ip)} flashed warm white")
 
     # ------------------------------------------------------------ lights
     def discover(self):

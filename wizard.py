@@ -322,7 +322,8 @@ class Host:
         import webview
         try:
             self.menu_win = webview.create_window(
-                "WiZard menu", url=resource("ui", "tray.html"), js_api=TrayApi(self), width=260, height=226,
+                "WiZard menu", url=resource("ui", "tray.html"), js_api=TrayApi(self),
+                width=self.MENU_SIZE[0], height=self.MENU_SIZE[1],
                 frameless=True, easy_drag=False, on_top=True, hidden=True, resizable=False,
                 background_color="#131519", text_select=False)
         except Exception:
@@ -357,10 +358,13 @@ class Host:
         except Exception:
             pass
 
+    MENU_SIZE = (260, 226)     # in screen points; multiplied by the display scale
+
     def show_tray_menu(self):
         """
         Open the themed menu next to the mouse, on the side away from the taskbar, wherever the taskbar
         is (bottom, top, left, right, or set to hide itself). Returns False to fall back to the plain menu.
+        The form is sized and placed directly on its own thread, so Windows cannot move it elsewhere.
         """
         win = self.menu_win
         if not (IS_WINDOWS and win and win.native):
@@ -378,28 +382,44 @@ class Host:
                             ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
             info = MONITORINFO()
             info.cbSize = ctypes.sizeof(info)
+            user32.MonitorFromPoint.restype = ctypes.c_void_p
+            user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             user32.GetMonitorInfoW(user32.MonitorFromPoint(pt, 2), ctypes.byref(info))
             mon, work = info.rcMonitor, info.rcWork
-            hwnd = win.native.Handle.ToInt32()
-            rect = wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            w, h = rect.right - rect.left, rect.bottom - rect.top
+            form = win.native
+            hwnd = form.Handle.ToInt64()
+            scale = 1.0
+            try:
+                user32.GetDpiForWindow.argtypes = [ctypes.c_void_p]
+                scale = (user32.GetDpiForWindow(ctypes.c_void_p(hwnd)) or 96) / 96
+            except Exception:
+                pass
+            w, h = int(self.MENU_SIZE[0] * scale), int(self.MENU_SIZE[1] * scale)
             # open toward the middle of the screen, away from the taskbar
             x = pt.x - w if pt.x > (mon.left + mon.right) // 2 else pt.x
             y = pt.y - h if pt.y > (mon.top + mon.bottom) // 2 else pt.y
-            # keep it on screen and off a taskbar that is showing; an auto-hidden taskbar leaves the work
-            # area the whole monitor, so the mouse position itself keeps the menu clear of it
+            # stay on screen and off a visible taskbar; an auto-hidden taskbar leaves the work area as the
+            # whole monitor, and opening from the mouse keeps the menu clear of it anyway
             x = max(work.left, min(x, work.right - w))
             y = max(work.top, min(y, work.bottom - h))
 
-            def place():
-                user32.SetWindowPos(hwnd, -1, x, y, 0, 0, 0x0001 | 0x0040)   # topmost, keep size, show
-                user32.SetForegroundWindow(hwnd)
+            done = []
 
-            place()
-            win.show()          # Windows may move a form the first time it is shown, so place it again after
-            place()
-            threading.Timer(0.05, place).start()
+            def work_on_ui():
+                from System.Drawing import Point, Size
+                from System.Windows.Forms import FormStartPosition
+                form.StartPosition = FormStartPosition.Manual
+                form.Size = Size(w, h)
+                form.Location = Point(x, y)
+                form.TopMost = True
+                form.Show()
+                form.Location = Point(x, y)
+                form.Activate()
+                done.append(True)
+            _on_ui_thread(win, work_on_ui)
+            if not done:
+                return False        # the plain Windows menu opens instead
+            user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
             return True
         except Exception:
             return False
