@@ -14,13 +14,42 @@ import time
 import wiz_core as W
 
 
+class _WriteLock:
+    """
+    The settings lock. Every `with ctl.lock:` block may change settings, so leaving one marks the cached
+    copy that get_settings hands out as stale. Readers use the plain lock and leave the cache alone.
+    """
+
+    def __init__(self, owner, lock):
+        self._owner, self._lock = owner, lock
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._owner._version += 1
+        self._lock.release()
+        return False
+
+    def acquire(self, *a, **k):
+        return self._lock.acquire(*a, **k)
+
+    def release(self):
+        self._owner._version += 1
+        self._lock.release()
+
+
 class Controller:
     LIVE_FPS = 12          # how often the window gets bulb colors while syncing
 
     def __init__(self, emit=lambda kind, data: None):
         self.emit = emit
         self.settings = W.load_settings()
-        self.lock = threading.RLock()
+        self._rlock = threading.RLock()          # plain lock for readers
+        self._version = 0                        # bumped whenever settings may have changed
+        self._cache = (None, None)               # (version, read-only copy of the settings)
+        self.lock = _WriteLock(self, self._rlock)
         self.engine = None
         self.fade_job = None
         self.fade_label = ""
@@ -50,10 +79,21 @@ class Controller:
 
     # ------------------------------------------------------------ settings
     def get_settings(self):
-        with self.lock:
-            return copy.deepcopy(self.settings)
+        """
+        A copy of the settings that callers only read. The sync engines ask for it many times a second,
+        so the same copy is handed out until something changes the settings, instead of a new deep copy
+        on every call. Callers must not modify it (none do).
+        """
+        with self._rlock:
+            version, copy_ = self._cache
+            if version != self._version:
+                copy_ = copy.deepcopy(self.settings)
+                self._cache = (self._version, copy_)
+            return copy_
 
     def save_soon(self):
+        with self._rlock:
+            self._version += 1          # belt and braces: every change also passes through here
         if self._save_timer:
             self._save_timer.cancel()
         self._save_timer = threading.Timer(0.6, lambda: W.save_settings(self.get_settings()))
@@ -158,8 +198,7 @@ class Controller:
         return out
 
     def snapshot(self):
-        with self.lock:
-            s = copy.deepcopy(self.settings)
+        s = self.get_settings()
         lights = []
         for ip in sorted(s["bulbs"]):
             b = s["bulbs"][ip]
@@ -679,7 +718,7 @@ class Controller:
 
     # ------------------------------------------------------------ presets
     def screen_values(self):
-        with self.lock:
+        with self._rlock:
             return {k: copy.deepcopy(self.settings[k]) for k in W.SCREEN_KEYS}
 
     def preset_changed(self):

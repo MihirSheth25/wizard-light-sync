@@ -394,7 +394,11 @@ function bulbGlyph(l, size = 40) {
   return el;
 }
 function paintBulb(el, l) {
-  const arcs = el.querySelector(".arcs"), lit = l && l.rgb;
+  const lit = l && l.rgb;
+  const key = lit ? l.rgb.join(",") + "/" + l.dim : "off";
+  if (el._painted === key) return;      // live updates repeat the same color often: skip identical style writes
+  el._painted = key;
+  const arcs = el.querySelector(".arcs");
   if (lit) {
     const a = 0.5 + 0.5 * (l.dim / 100);
     arcs.setAttribute("stroke", rgbCss(l.rgb));

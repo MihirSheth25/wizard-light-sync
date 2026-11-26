@@ -254,9 +254,19 @@ def crop_margins(frame, s):
     return frame[t:b, l:r]
 
 
+def _max3(a, b, c):
+    """Elementwise max of three arrays. Same values as stacking them and taking max over that axis,
+    but numpy reduces a length-3 axis slowly, so this is many times faster."""
+    return np.maximum(np.maximum(a, b), c)
+
+
+def _min3(a, b, c):
+    return np.minimum(np.minimum(a, b), c)
+
+
 def strip_black_bars(frame, threshold=12):
     """Remove letterbox / pillarbox bars so movies do not read as darker than they are."""
-    lum = frame.max(axis=2)
+    lum = _max3(frame[..., 0], frame[..., 1], frame[..., 2])
     rows = np.where(lum.mean(axis=1) > threshold)[0]
     cols = np.where(lum.mean(axis=0) > threshold)[0]
     if len(rows) < frame.shape[0] * 0.2 or len(cols) < frame.shape[1] * 0.2:
@@ -269,8 +279,8 @@ def pick_color(pixels, mode="Vivid", saturation_boost=2.0):
     px = pixels.reshape(-1, 3).astype(np.float32) / 255.0
     if px.size == 0:
         return 0, 0, 0, 0.0
-    mx = px.max(axis=1)
-    mn = px.min(axis=1)
+    mx = _max3(px[:, 0], px[:, 1], px[:, 2])
+    mn = _min3(px[:, 0], px[:, 1], px[:, 2])
     brightness = float(mx.mean())
     sat = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-6), 0.0)
 
@@ -501,12 +511,15 @@ class ScreenEngine(BulbEngine):
                 if s["ignore_black_bars"]:
                     frame = strip_black_bars(frame)
 
+                picked = {}           # screen area -> its color this frame, shared by lights on the same area
                 for ip, b in bulbs.items():
                     if self.held(ip):
                         last_sent.pop(ip, None)
                         continue
-                    r, g, bl, bright = pick_color(crop_zone(frame, b.get("zone", "Full screen")),
-                                                  s["color_mode"], s["saturation"])
+                    zone = b.get("zone", "Full screen")
+                    if zone not in picked:
+                        picked[zone] = pick_color(crop_zone(frame, zone), s["color_mode"], s["saturation"])
+                    r, g, bl, bright = picked[zone]
                     a = max(0.0, min(0.95, float(s["smoothing"])))
                     new = np.array([r, g, bl, bright], dtype=np.float32)
                     prev = smooth.get(ip)
@@ -622,6 +635,18 @@ class MusicAnalyzer:
         self.heard = 0               # blocks of real sound so far, so the slow average can settle
         self.surging = False
         self.last_surge = 0.0
+        self._tables = {}            # block length -> window and frequency masks, built once
+
+    def _table(self, n):
+        t = self._tables.get(n)
+        if t is None:
+            freqs = np.fft.rfftfreq(n, 1.0 / self.sr)
+            bands = [(freqs >= lo) & (freqs < hi) for lo, hi in ((20, 250), (250, 2000), (2000, 8000))]
+            t = {"window": np.hanning(n), "bands": [(m, bool(np.any(m))) for m in bands],
+                 "low": (freqs >= 30) & (freqs < 300), "mid": (freqs >= 300) & (freqs < 4000),
+                 "kick": (freqs >= 30) & (freqs < 160)}
+            self._tables[n] = t
+        return t
 
     def analyze(self, mono, sensitivity=1.0, now=None):
         now = time.time() if now is None else now
@@ -637,19 +662,17 @@ class MusicAnalyzer:
         if level > 0.05:
             self.heard += 1
 
-        spec = np.abs(np.fft.rfft(mono * np.hanning(len(mono))))
-        freqs = np.fft.rfftfreq(len(mono), 1.0 / self.sr)
-        edges = [(20, 250), (250, 2000), (2000, 8000)]
-        bands = np.array([spec[(freqs >= lo) & (freqs < hi)].mean() if np.any((freqs >= lo) & (freqs < hi))
-                          else 0.0 for lo, hi in edges])
+        tab = self._table(len(mono))
+        spec = np.abs(np.fft.rfft(mono * tab["window"]))
+        bands = np.array([spec[m].mean() if has else 0.0 for m, has in tab["bands"]])
         self.band_peaks = np.maximum(bands, self.band_peaks * 0.995)
         norm = np.clip(bands / np.maximum(self.band_peaks, 1e-6), 0, 1)
         if rms < 2e-4:
             norm[:] = 0
 
         # spectral flux, weighted toward the kick drum and snare range
-        low = spec[(freqs >= 30) & (freqs < 300)]
-        mid = spec[(freqs >= 300) & (freqs < 4000)]
+        low = spec[tab["low"]]
+        mid = spec[tab["mid"]]
         cur = np.concatenate([low * 2.0, mid * 0.5])
         cur = np.log1p(cur * 50)
         flux = 0.0 if self.prev_spec is None else float(np.maximum(cur - self.prev_spec, 0).sum())
@@ -668,7 +691,7 @@ class MusicAnalyzer:
         # a surge is the moment the music jumps clearly louder, like a drop or a chorus
         loud_now = self.heard > 250 and self.fast_level > max(0.3, self.slow_level * 1.8)
         # kick drum: flux in the lowest band alone, which hi-hats and vocals barely touch
-        kick_spec = np.log1p(spec[(freqs >= 30) & (freqs < 160)] * 50)
+        kick_spec = np.log1p(spec[tab["kick"]] * 50)
         kflux = 0.0 if self.prev_low is None else float(np.maximum(kick_spec - self.prev_low, 0).sum())
         self.prev_low = kick_spec
         self.kick_hist.append(kflux)
