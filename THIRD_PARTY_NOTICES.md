@@ -4,14 +4,16 @@ WiZard's own code is under the MIT License (see [LICENSE](LICENSE)). It uses the
 
 | Package | What WiZard uses it for | License |
 | --- | --- | --- |
-| [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) | Window, buttons, sliders and other widgets | MIT |
 | [mss](https://github.com/BoboTiG/python-mss) | Screen capture for screen sync | MIT |
 | [NumPy](https://numpy.org) | Color and audio math | BSD 3-Clause |
-| [Pillow](https://python-pillow.org) | Drawing the room preview, icons and color wheel | MIT-CMU (HPND) |
+| [Pillow](https://python-pillow.org) | Loading the tray icon images | MIT-CMU (HPND) |
+| [pywebview](https://github.com/r0x0r/pywebview) | The app window, which shows the interface page in WebView2 | BSD 3-Clause |
 | [pystray](https://github.com/moses-palmer/pystray) | System tray icon | LGPL-3.0 |
 | [SoundCard](https://github.com/bastibe/SoundCard) | Loopback audio for music sync | BSD 3-Clause |
 
-These packages also pull in their own dependencies (such as `cffi` for SoundCard and `darkdetect` for CustomTkinter), each under its own license.
+These packages also pull in their own dependencies (such as `cffi` for SoundCard, and `pythonnet` and `bottle` for pywebview), each under its own license.
+
+The window is drawn by the Microsoft Edge WebView2 Runtime, which is part of Windows or installed from Microsoft. WiZard does not include it.
 
 ## If you share a built .exe
 
@@ -29,4 +31,4 @@ WiZ, WiZ Connected and Philips are trademarks of Signify Holding or its affiliat
 
 ## Fonts
 
-The app asks Windows for the Bahnschrift and Segoe UI fonts that ship with Windows. No font files are included in this repository or in a built .exe.
+The interface asks Windows for the Segoe UI fonts that ship with Windows. No font files are included in this repository or in a built .exe.
